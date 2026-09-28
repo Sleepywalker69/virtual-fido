@@ -131,7 +131,7 @@ func (r *ApprovalRequest) finish(outcome ApprovalOutcome) {
 // because the authenticator handles one command at a time.
 type ApprovalBroker struct {
 	// Timeout denies a request nobody answers. Zero means wait until the
-	// browser gives up.
+	// browser gives up. Change it with SetTimeout once requests may arrive.
 	Timeout time.Duration
 	// OnRequest is called (from an authenticator goroutine) when a request
 	// needs the user; it must not block.
@@ -142,6 +142,13 @@ type ApprovalBroker struct {
 	mu      sync.Mutex
 	current *ApprovalRequest
 	nextID  uint64
+}
+
+// SetTimeout changes Timeout safely while requests may be in flight.
+func (b *ApprovalBroker) SetTimeout(timeout time.Duration) {
+	b.mu.Lock()
+	b.Timeout = timeout
+	b.mu.Unlock()
 }
 
 // ApproveClientAction implements fido_client.ClientRequestApprover.
@@ -155,6 +162,7 @@ func (b *ApprovalBroker) ApproveClientActionContext(ctx context.Context, action 
 	b.mu.Lock()
 	b.nextID++
 	now := time.Now()
+	timeoutDuration := b.Timeout
 	request := &ApprovalRequest{
 		ID:       b.nextID,
 		Action:   action,
@@ -163,8 +171,8 @@ func (b *ApprovalBroker) ApproveClientActionContext(ctx context.Context, action 
 		decision: make(chan bool, 1),
 		done:     make(chan struct{}),
 	}
-	if b.Timeout > 0 {
-		request.Deadline = now.Add(b.Timeout)
+	if timeoutDuration > 0 {
+		request.Deadline = now.Add(timeoutDuration)
 	}
 	b.current = request
 	onRequest, onResolved := b.OnRequest, b.OnResolved
@@ -174,8 +182,8 @@ func (b *ApprovalBroker) ApproveClientActionContext(ctx context.Context, action 
 		onRequest(request)
 	}
 	var timeout <-chan time.Time
-	if b.Timeout > 0 {
-		timer := time.NewTimer(b.Timeout)
+	if timeoutDuration > 0 {
+		timer := time.NewTimer(timeoutDuration)
 		defer timer.Stop()
 		timeout = timer.C
 	}

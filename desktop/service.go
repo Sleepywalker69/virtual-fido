@@ -104,14 +104,14 @@ func NewService(settings *Settings, attacher Attacher) *Service {
 	return service
 }
 
-// SetVerboseLogging routes the authenticator's log output to Log (debug, or
-// trace when verbose).
+// SetVerboseLogging routes the authenticator's log output to Log: errors and
+// the service's own events normally, every USB/CTAP message when verbose.
 func (s *Service) SetVerboseLogging(verbose bool) {
 	virtual_fido.SetLogOutput(s.Log)
 	if verbose {
 		virtual_fido.SetLogLevel(util.LogLevelTrace)
 	} else {
-		virtual_fido.SetLogLevel(util.LogLevelDebug)
+		virtual_fido.SetLogLevel(util.LogLevelEnabled)
 	}
 }
 
@@ -479,6 +479,16 @@ func (s *Service) SetPINSupport(enabled bool) error {
 	}
 	s.changed()
 	return nil
+}
+
+// Passphrase returns the unlocked vault's passphrase (to remember it).
+func (s *Service) Passphrase() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store == nil {
+		return "", ErrLocked
+	}
+	return s.store.Passphrase(), nil
 }
 
 // ChangePassphrase re-encrypts the vault with a new passphrase.

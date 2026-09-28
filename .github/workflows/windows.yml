@@ -1,0 +1,88 @@
+name: Windows build
+
+on:
+  push:
+    branches: [master, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Everything except the macOS-only cgo package.
+  PACKAGES: ./ ./cmd/... ./cose/... ./crypto/... ./ctap/... ./ctap_hid/... ./desktop/... ./fido_client/... ./identities/... ./test/... ./u2f/... ./usb/... ./usbip/... ./util/... ./webauthn/...
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Vet
+        run: go vet $PACKAGES
+      - name: Unit tests (race detector)
+        run: go test -race $PACKAGES
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: End-to-end test over USB/IP
+        run: |
+          pip install fido2
+          go build -race -o e2e-server ./test/e2e/server
+          echo approve > policy.txt
+          ./e2e-server -vault e2e-vault.json -policy-file policy.txt > server.log 2>&1 &
+          SERVER=$!
+          # A second authenticator with its own vault, driven like the Windows
+          # HID driver (several interrupt-IN transfers pending at once).
+          ./e2e-server -listen 127.0.0.1:3241 -vault e2e-vault-2.json -policy-file policy.txt > server2.log 2>&1 &
+          SERVER2=$!
+          sleep 2
+          status=0
+          python test/e2e/e2e_usbip_fido2.py --policy-file policy.txt || status=1
+          python test/e2e/e2e_usbip_fido2.py --policy-file policy.txt --port 3241 --in-urbs 3 || status=1
+          kill $SERVER $SERVER2
+          if grep -q "DATA RACE" server.log server2.log; then grep -A30 "DATA RACE" server.log server2.log | head -80; status=1; fi
+          exit $status
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Vet
+        shell: bash
+        run: go vet $PACKAGES
+      - name: Unit tests
+        shell: bash
+        run: go test $PACKAGES
+      - name: Build vfido.exe
+        shell: bash
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/vfido.exe ./cmd/vfido-gui
+          GOARCH=arm64 go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/vfido-arm64.exe ./cmd/vfido-gui
+          go build -trimpath -o e2e-server.exe ./test/e2e/server
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: End-to-end test over USB/IP (Windows build of the authenticator)
+        shell: pwsh
+        run: |
+          pip install fido2
+          Set-Content -Path policy.txt -Value approve
+          $server = Start-Process -FilePath .\e2e-server.exe -ArgumentList "-vault","e2e-vault.json","-policy-file","policy.txt" -PassThru -NoNewWindow -RedirectStandardOutput server.log -RedirectStandardError server.err
+          Start-Sleep -Seconds 3
+          python test/e2e/e2e_usbip_fido2.py --policy-file policy.txt --in-urbs 2
+          $code = $LASTEXITCODE
+          Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
+          if ($code -ne 0) { Get-Content server.log -Tail 80; Get-Content server.err -Tail 40 }
+          exit $code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vfido-windows
+          path: dist/*.exe

@@ -221,8 +221,8 @@ func (a *app) showApproval(request *desktop.ApprovalRequest) {
 	a.closeApprovalWindow()
 
 	hint := "Click Approve to continue, or Deny."
-	if a.settings.ApproveHotkey != "" {
-		hint = fmt.Sprintf("Press %s (your macropad key) or click Approve.", a.settings.ApproveHotkey)
+	if a.approveHotkeyActive != "" {
+		hint = fmt.Sprintf("Press %s (your macropad key) or click Approve.", a.approveHotkeyActive)
 	}
 	var dialog *walk.Dialog
 	var approveButton, denyButton *walk.PushButton
@@ -243,8 +243,8 @@ func (a *app) showApproval(request *desktop.ApprovalRequest) {
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
 					HSpacer{},
-					PushButton{AssignTo: &approveButton, Text: "&Approve", MinSize: Size{Width: 110}, OnClicked: request.Approve},
-					PushButton{AssignTo: &denyButton, Text: "&Deny", MinSize: Size{Width: 90}, OnClicked: request.Deny},
+					PushButton{AssignTo: &approveButton, Text: "Approve", MinSize: Size{Width: 110}, OnClicked: request.Approve},
+					PushButton{AssignTo: &denyButton, Text: "Deny", MinSize: Size{Width: 90}, OnClicked: request.Deny},
 				},
 			},
 		},
@@ -255,6 +255,19 @@ func (a *app) showApproval(request *desktop.ApprovalRequest) {
 	}
 	// Closing the window without choosing denies the request.
 	dialog.Closing().Attach(func(canceled *bool, reason walk.CloseReason) { request.Deny() })
+	// The pop-up is not modal, so the dialog manager does not handle its keys:
+	// Esc denies, Tab and the arrow keys move between the two buttons.
+	for _, pair := range [][2]*walk.PushButton{{approveButton, denyButton}, {denyButton, approveButton}} {
+		other := pair[1]
+		pair[0].KeyDown().Attach(func(key walk.Key) {
+			switch key {
+			case walk.KeyEscape:
+				request.Deny()
+			case walk.KeyTab, walk.KeyLeft, walk.KeyRight:
+				other.SetFocus()
+			}
+		})
+	}
 	window := &approvalWindow{request: request, dialog: dialog, countdown: countdown, stop: make(chan struct{})}
 	a.approval = window
 	a.updateCountdown(window)

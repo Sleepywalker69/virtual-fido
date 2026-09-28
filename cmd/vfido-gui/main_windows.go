@@ -45,6 +45,9 @@ type app struct {
 	verbose  bool
 	exiting  bool
 	shown    *walk.Icon // icon currently on the window
+	// approveHotkeyActive is the approve hotkey as registered ("" if none
+	// or registration failed), for the pop-up hint.
+	approveHotkeyActive string
 
 	mw       *walk.MainWindow
 	tray     *walk.NotifyIcon
@@ -558,8 +561,11 @@ func (a *app) applyHotkeys() {
 		}
 	}
 	errs := a.hotkeys.Set(approve, deny)
+	a.approveHotkeyActive = ""
 	if err := errs[hotkeyApprove]; err != nil {
 		problems = append(problems, "Approve hotkey: "+err.Error())
+	} else if approve != nil {
+		a.approveHotkeyActive = a.settings.ApproveHotkey
 	}
 	if err := errs[hotkeyDeny]; err != nil {
 		problems = append(problems, "Deny hotkey: "+err.Error())

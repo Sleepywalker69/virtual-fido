@@ -16,3 +16,6 @@ vault.data
 # OS noise
 .DS_Store
 /target
+
+# Python bytecode (test/e2e)
+__pycache__/

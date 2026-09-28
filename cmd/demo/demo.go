@@ -251,6 +251,7 @@ func createClient() *fido_client.DefaultFIDOClient {
 	caPrivateKey, err := identities.CreateCAPrivateKey()
 	checkErr(err, "Could not generate attestation CA private key")
 	certificateAuthority, err := identities.CreateSelfSignedCA(caPrivateKey)
+	checkErr(err, "Could not create attestation CA")
 	encryptionKey := sha256.Sum256([]byte("test"))
 
 	virtual_fido.SetLogOutput(os.Stdout)
@@ -264,7 +265,12 @@ func createClient() *fido_client.DefaultFIDOClient {
 		support.fingerprintUser = fingerprintUser
 	}
 	// Disable PIN by default for maximum compatibility; can be enabled via CLI later
-	return fido_client.NewDefaultClient(certificateAuthority, caPrivateKey, encryptionKey, false, &support, &support, &support)
+	client, err := fido_client.LoadDefaultClient(certificateAuthority, caPrivateKey, encryptionKey, false, &support, &support, &support)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not open vault '%s': %v\n", vaultFilename, err)
+		os.Exit(1)
+	}
+	return client
 }
 
 var rootCmd = &cobra.Command{
@@ -273,16 +279,15 @@ var rootCmd = &cobra.Command{
 	Long: `demo attaches a virtual FIDO2 authenticator and manages stored credentials.
 
 Common tasks:
-  • demo export --format archive --all --output passkeys.passkey
-      Export all credentials as a .passkey ZIP bundle.
-  • demo export --format keepassxc --identity abcd --output-dir ./passkeys
-      Export passkeys as KeePassXC-compatible JSON files (one per identity).
-  • node scripts/export_aegis_otpauth.js --vault vault.json --passphrase passphrase --out export_otpauth.txt
-      Generate Base32-wrapped credential blobs as otpauth:// URIs (text file).
-  • node scripts/export_aegis_qr.js --vault vault.json --passphrase passphrase --out-dir ./qr_codes
-      Render passkey payloads as QR codes for transfer to other devices.
+  • demo start
+      Attach the virtual authenticator (approve requests in this terminal).
+  • demo list | demo delete --identity abcd
+      Show or remove stored credentials.
   • demo pin enable | demo pin set --pin 1234
-      Enable or assign a 4+ character PIN (letters/digits) for the virtual authenticator.`,
+      Enable or assign a 4+ character PIN (letters/digits) for the virtual authenticator.
+
+On Windows, the Virtual FIDO app (cmd/vfido-gui) is easier: it has a window,
+approval pop-ups and a macropad hotkey.`,
 }
 
 func init() {

@@ -1,11 +1,30 @@
 package usbip
 
 import (
+	"bytes"
 	"fmt"
+
+	"github.com/bulwarkid/virtual-fido/util"
 )
 
 const (
 	usbipVersion = 0x0111
+)
+
+// Transfer completion statuses as they appear on the wire: negated Linux errno
+// values, whatever OS the server runs on.
+const (
+	StatusOK    int32 = 0
+	StatusStall int32 = -32 // -EPIPE: request not supported / endpoint halted
+
+	statusConnectionReset int32 = -104 // -ECONNRESET: URB was unlinked
+)
+
+// OP_REP_IMPORT status codes (see Linux usbip_common.h).
+const (
+	opStatusOK         uint32 = 0
+	opStatusDeviceBusy uint32 = 2
+	opStatusNoDevice   uint32 = 4
 )
 
 type usbipDirection uint32
@@ -17,7 +36,7 @@ const (
 
 var usbipDirectionDescriptions = map[usbipDirection]string{
 	usbipDirOut: "usbipDirOut",
-	usbipDirIn: "usbipDirIn",
+	usbipDirIn:  "usbipDirIn",
 }
 
 type usbipControlCommand uint16
@@ -53,9 +72,9 @@ var usbipCommandDescriptions = map[usbipCommand]string{
 }
 
 type usbipControlHeader struct {
-	Version     uint16
+	Version uint16
 	Command usbipControlCommand
-	Status      uint32
+	Status  uint32
 }
 
 func (header *usbipControlHeader) String() string {
@@ -66,26 +85,20 @@ func (header *usbipControlHeader) String() string {
 	return fmt.Sprintf("USBIPControlHeader{ Version: 0x%04x, Command: %s, Status: 0x%08x }", header.Version, commandDesc, header.Status)
 }
 
-type usbipOpRepDevlist struct {
-	Header     usbipControlHeader
-	NumDevices uint32
-	Devices    []USBIPDeviceSummary
-}
-
-func newOpRepDevlist(devices []USBIPDevice) usbipOpRepDevlist {
-	summaries := make([]USBIPDeviceSummary, len(devices))
-	for i := range devices {
-		summaries[i] = devices[i].DeviceSummary()
+// encodeOpRepDevlist builds OP_REP_DEVLIST. It is encoded piecewise because
+// binary.Write cannot encode a struct that contains a slice.
+func encodeOpRepDevlist(devices []USBIPDevice) []byte {
+	buffer := new(bytes.Buffer)
+	buffer.Write(util.ToBE(usbipControlHeader{
+		Version: usbipVersion,
+		Command: usbipCommandOpRepDevlist,
+		Status:  opStatusOK,
+	}))
+	buffer.Write(util.ToBE(uint32(len(devices))))
+	for _, device := range devices {
+		buffer.Write(util.ToBE(device.DeviceSummary()))
 	}
-	return usbipOpRepDevlist{
-		Header: usbipControlHeader{
-			Version:     usbipVersion,
-			Command: usbipCommandOpRepDevlist,
-			Status:      0,
-		},
-		NumDevices: uint32(len(devices)),
-		Devices:    summaries,
-	}
+	return buffer.Bytes()
 }
 
 type usbipOpRepImport struct {
@@ -100,9 +113,9 @@ func (reply usbipOpRepImport) String() string {
 func newOpRepImport(device USBIPDevice) usbipOpRepImport {
 	return usbipOpRepImport{
 		Header: usbipControlHeader{
-			Version:     usbipVersion,
+			Version: usbipVersion,
 			Command: usbipCommandOpRepImport,
-			Status:      0,
+			Status:  opStatusOK,
 		},
 		Device: device.DeviceSummary().Header,
 	}
@@ -110,9 +123,9 @@ func newOpRepImport(device USBIPDevice) usbipOpRepImport {
 
 func opRepImportError(statusCode uint32) usbipControlHeader {
 	return usbipControlHeader{
-		Version:     usbipVersion,
+		Version: usbipVersion,
 		Command: usbipCommandOpRepImport,
-		Status:      statusCode,
+		Status:  statusCode,
 	}
 }
 
@@ -135,6 +148,8 @@ func (header usbipMessageHeader) String() string {
 		header.Endpoint)
 }
 
+// replyHeader echoes the sequence number; devid, direction and ep are zero in
+// replies (the client matches replies by sequence number).
 func (header usbipMessageHeader) replyHeader() usbipMessageHeader {
 	var command usbipCommand
 	switch header.Command {
@@ -172,7 +187,7 @@ func (body usbipCommandSubmitBody) String() string {
 }
 
 type usbipReturnSubmitBody struct {
-	Status          uint32
+	Status          int32
 	ActualLength    uint32
 	StartFrame      uint32
 	NumberOfPackets uint32
@@ -238,12 +253,21 @@ func (header USBIPDeviceSummaryHeader) String() string {
 type USBIPDeviceInterface struct {
 	BInterfaceClass    uint8
 	BInterfaceSubclass uint8
+	BInterfaceProtocol uint8
 	Padding            uint8
 }
 
+// USBIPDevice is a device exported over USB/IP.
 type USBIPDevice interface {
-	HandleMessage(id uint32, onFinish func(response []byte), endpoint uint32, setupBytes []byte, transferBuffer []byte)
+	// HandleMessage processes one URB. onFinish must be called exactly once,
+	// possibly later and from another goroutine, with the response data (IN
+	// transfers) and a completion status (StatusOK or StatusStall).
+	HandleMessage(id uint32, onFinish func(response []byte, status int32), endpoint uint32, setupBytes []byte, transferBuffer []byte)
 	RemoveWaitingRequest(id uint32) bool
 	BusID() string
 	DeviceSummary() USBIPDeviceSummary
+	// Attached is called when a host imports the device and Detached when that
+	// host's connection ends.
+	Attached()
+	Detached()
 }

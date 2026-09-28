@@ -2,19 +2,26 @@ package util
 
 import "sync"
 
+// RequestBuffer pairs asynchronously produced responses with pending requests.
+// Requests are completed in the order they were made, the way a USB endpoint
+// completes queued transfers; responses that arrive while nothing is pending
+// are queued for the next request.
 type RequestBuffer struct {
-	lock           *sync.Mutex
-	waitingForData map[uint32]func([]byte)
-	responses      [][]byte
+	lock      sync.Mutex
+	waiting   []pendingRequest
+	responses [][]byte
 }
 
+type pendingRequest struct {
+	id      uint32
+	respond func([]byte)
+}
+
+// maxQueuedResponses bounds the responses held while no request is pending.
+const maxQueuedResponses = 1024
+
 func MakeRequestBuffer() *RequestBuffer {
-	buffer := RequestBuffer{
-		lock:           &sync.Mutex{},
-		waitingForData: make(map[uint32]func([]byte)),
-		responses:      make([][]byte, 0),
-	}
-	return &buffer
+	return &RequestBuffer{}
 }
 
 func (buffer *RequestBuffer) Request(id uint32, request func(response []byte)) bool {
@@ -25,37 +32,43 @@ func (buffer *RequestBuffer) Request(id uint32, request func(response []byte)) b
 		buffer.responses = buffer.responses[1:]
 		request(response)
 		return true
-	} else {
-		buffer.waitingForData[id] = request
-		return false
 	}
+	buffer.waiting = append(buffer.waiting, pendingRequest{id: id, respond: request})
+	return false
 }
 
 func (buffer *RequestBuffer) CancelRequest(id uint32) bool {
 	buffer.lock.Lock()
 	defer buffer.lock.Unlock()
-	if _, ok := buffer.waitingForData[id]; ok {
-		delete(buffer.waitingForData, id)
-		return true
-	} else {
-		return false
+	for i, pending := range buffer.waiting {
+		if pending.id == id {
+			buffer.waiting = append(buffer.waiting[:i], buffer.waiting[i+1:]...)
+			return true
+		}
 	}
+	return false
 }
 
 func (buffer *RequestBuffer) Respond(data []byte) {
 	buffer.lock.Lock()
-	if len(buffer.waitingForData) > 0 {
-		// Get first waiting request
-		var id uint32
-		var request func([]byte)
-		for id, request = range buffer.waitingForData {
-			break
-		}
-		delete(buffer.waitingForData, id)
-		buffer.lock.Unlock()
-		request(data)
-	} else {
-		buffer.responses = append(buffer.responses, data)
-		buffer.lock.Unlock()
+	defer buffer.lock.Unlock()
+	if len(buffer.waiting) > 0 {
+		next := buffer.waiting[0]
+		buffer.waiting = buffer.waiting[1:]
+		next.respond(data)
+		return
 	}
+	if len(buffer.responses) >= maxQueuedResponses {
+		buffer.responses = buffer.responses[1:]
+	}
+	buffer.responses = append(buffer.responses, data)
+}
+
+// Reset drops every pending request and queued response, e.g. when the host
+// that made the requests disconnects.
+func (buffer *RequestBuffer) Reset() {
+	buffer.lock.Lock()
+	defer buffer.lock.Unlock()
+	buffer.waiting = nil
+	buffer.responses = nil
 }

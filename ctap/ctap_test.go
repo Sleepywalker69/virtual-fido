@@ -89,7 +89,7 @@ func TestMakeCredential(t *testing.T) {
 	ctap := NewCTAPServer(client)
 
 	args := makeCredentialArgs{
-		ClientDataHash: []byte{},
+		ClientDataHash: crypto.RandomBytes(32),
 		RP: &webauthn.PublicKeyCredentialRPEntity{
 			ID:   "example.com",
 			Name: "Example",

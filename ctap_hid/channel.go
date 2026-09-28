@@ -1,53 +1,18 @@
 package ctap_hid
 
 import (
-	"fmt"
-	"sync"
-
 	"github.com/bulwarkid/virtual-fido/util"
 )
 
+// ctapHIDChannel holds the message being reassembled on one channel. It is
+// only touched by HandleMessage, which processes reports sequentially.
 type ctapHIDChannel struct {
-	server      *CTAPHIDServer
 	channelId   ctapHIDChannelID
-	messageLock sync.Locker
 	transaction *ctapHIDTransaction
 }
 
-func newCTAPHIDChannel(server *CTAPHIDServer, channelId ctapHIDChannelID) *ctapHIDChannel {
-	return &ctapHIDChannel{
-		server:      server,
-		channelId:   channelId,
-		messageLock: &sync.Mutex{},
-		transaction: nil,
-	}
-}
-
-func (channel *ctapHIDChannel) handleMessage(message []byte) {
-	channel.messageLock.Lock()
-	defer channel.messageLock.Unlock()
-	if channel.transaction == nil {
-		channel.transaction = newCTAPHIDTransaction(message)
-	} else {
-		channel.transaction.addMessage(message)
-	}
-	if channel.transaction.done {
-		if channel.transaction.errorCode != 0 {
-			channel.server.sendError(channel.channelId, channel.transaction.errorCode)
-		} else if !channel.transaction.cancelled {
-			channel.handleFinalizedMessage(channel.transaction.result.header, channel.transaction.result.payload)
-		}
-		channel.transaction = nil
-	}
-}
-
-func (channel *ctapHIDChannel) handleFinalizedMessage(header ctapHIDMessageHeader, payload []byte) {
-	ctapHIDLogger.Printf("CTAPHID FINALIZED MESSAGE: %s %#v\n\n", header, payload)
-	if channel.channelId == ctapHIDBroadcastChannel {
-		channel.handleBroadcastMessage(header, payload)
-	} else {
-		channel.handleDataMessage(header, payload)
-	}
+func newCTAPHIDChannel(channelId ctapHIDChannelID) *ctapHIDChannel {
+	return &ctapHIDChannel{channelId: channelId}
 }
 
 type ctapHIDInitResponse struct {
@@ -60,65 +25,43 @@ type ctapHIDInitResponse struct {
 	CapabilitiesFlags  ctapHIDCapabilityFlag
 }
 
-func (channel *ctapHIDChannel) handleBroadcastMessage(header ctapHIDMessageHeader, payload []byte) {
-	switch header.Command {
-	case ctapHIDCommandInit:
-		newChannel := channel.server.newChannel()
-		nonce := payload[:8]
-		response := ctapHIDInitResponse{
-			NewChannelID:       newChannel.channelId,
-			ProtocolVersion:    2,
-			DeviceVersionMajor: 0,
-			DeviceVersionMinor: 0,
-			DeviceVersionBuild: 1,
-			CapabilitiesFlags:  ctapHIDCapabilityCBOR,
-		}
-		copy(response.Nonce[:], nonce)
-		ctapHIDLogger.Printf("CTAPHID INIT RESPONSE: %#v\n\n", response)
-		// Per CTAP HID spec, the INIT response payload layout is:
-		// [8] Nonce | [4] New CID (big-endian) | [1] ProtocolVersion | [3] DeviceVersion | [1] Capabilities
-		payloadResp := util.Concat(
-			nonce,
-			util.ToBE(response.NewChannelID),
-			[]byte{response.ProtocolVersion, response.DeviceVersionMajor, response.DeviceVersionMinor, response.DeviceVersionBuild, byte(response.CapabilitiesFlags)},
-		)
-		channel.server.sendResponse(ctapHIDBroadcastChannel, ctapHIDCommandInit, payloadResp)
-	case ctapHIDCommandPing:
-		channel.server.sendResponse(ctapHIDBroadcastChannel, ctapHIDCommandPing, payload)
-	default:
-		util.Panic(fmt.Sprintf("Invalid CTAPHID Broadcast command: %#v", header))
+// handleBroadcastMessage handles the broadcast channel, which only carries
+// CTAPHID_INIT (channel allocation).
+func (server *CTAPHIDServer) handleBroadcastMessage(message []byte) {
+	transaction := newCTAPHIDTransaction(message)
+	if !transaction.done || transaction.errorCode != 0 || transaction.cancelled {
+		return
 	}
+	header := transaction.result.header
+	if header.Command != ctapHIDCommandInit {
+		server.sendError(ctapHIDBroadcastChannel, ctapHIDErrorInvalidCommand)
+		return
+	}
+	if len(transaction.result.payload) < 8 {
+		server.sendError(ctapHIDBroadcastChannel, ctapHIDErrorInvalidLength)
+		return
+	}
+	channel := server.newChannel()
+	server.sendInitResponse(ctapHIDBroadcastChannel, transaction.result.payload[:8], channel.channelId)
 }
 
-func (channel *ctapHIDChannel) handleDataMessage(header ctapHIDMessageHeader, payload []byte) {
-	switch header.Command {
-	case ctapHIDCommandMsg:
-		responsePayload := channel.server.u2fServer.HandleMessage(payload)
-		ctapHIDLogger.Printf("CTAPHID MSG RESPONSE: %d %#v\n\n", len(responsePayload), responsePayload)
-		channel.server.sendResponse(header.ChannelID, ctapHIDCommandMsg, responsePayload)
-	case ctapHIDCommandCBOR:
-		// Default keepalive should indicate processing; set UP_NEEDED only when explicitly waiting for touch.
-		stop := util.StartRecurringFunction(keepConnectionAlive(channel.server, channel.channelId, ctapHIDStatusProcessing), 50)
-		var responsePayload []byte
-		// Debug: log dispatch to CTAP with channel + payload length
-		ctapHIDLogger.Printf("CTAPHID dispatch CBOR to CTAP: ch=0x%x len=%d\n\n", channel.channelId, len(payload))
-		if client, ok := channel.server.ctapServer.(interface{ HandleMessageForChannel(uint32, []byte) []byte }); ok {
-			responsePayload = client.HandleMessageForChannel(uint32(channel.channelId), payload)
-		} else {
-			responsePayload = channel.server.ctapServer.HandleMessage(payload)
-		}
-		stop <- 0
-		ctapHIDLogger.Printf("CTAPHID CBOR RESPONSE: %#v\n\n", responsePayload)
-		channel.server.sendResponse(header.ChannelID, ctapHIDCommandCBOR, responsePayload)
-	case ctapHIDCommandPing:
-		channel.server.sendResponse(header.ChannelID, ctapHIDCommandPing, payload)
-	default:
-		panic(fmt.Sprintf("Invalid CTAPHID Channel command: %s", header))
+// sendInitResponse replies to CTAPHID_INIT. Payload layout:
+// [8] nonce | [4] channel ID (big endian) | [1] protocol version | [3] device version | [1] capabilities
+func (server *CTAPHIDServer) sendInitResponse(onChannel ctapHIDChannelID, nonce []byte, channelID ctapHIDChannelID) {
+	response := ctapHIDInitResponse{
+		NewChannelID:       channelID,
+		ProtocolVersion:    2,
+		DeviceVersionMajor: 0,
+		DeviceVersionMinor: 0,
+		DeviceVersionBuild: 1,
+		CapabilitiesFlags:  ctapHIDCapabilityCBOR,
 	}
-}
-
-func keepConnectionAlive(server *CTAPHIDServer, channelId ctapHIDChannelID, status byte) func() {
-	return func() {
-		server.sendResponse(channelId, ctapHIDCommandKeepalive, []byte{status})
-	}
+	copy(response.Nonce[:], nonce)
+	ctapHIDLogger.Printf("CTAPHID INIT RESPONSE: %#v\n\n", response)
+	payload := util.Concat(
+		response.Nonce[:],
+		util.ToBE(response.NewChannelID),
+		[]byte{response.ProtocolVersion, response.DeviceVersionMajor, response.DeviceVersionMinor, response.DeviceVersionBuild, byte(response.CapabilitiesFlags)},
+	)
+	server.sendResponse(onChannel, ctapHIDCommandInit, payload)
 }

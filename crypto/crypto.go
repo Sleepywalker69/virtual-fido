@@ -4,12 +4,14 @@ import (
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"math/big"
 
@@ -178,9 +180,45 @@ func GenerateECDHKey() *ECDHKey {
 	return &ECDHKey{Priv: priv, X: x, Y: y}
 }
 
+// ECDH returns the shared x-coordinate with the peer's point, or nil if the
+// point is not on P-256.
 func (key *ECDHKey) ECDH(remoteX, remoteY *big.Int) []byte {
-	secret, _ := elliptic.P256().Params().ScalarMult(remoteX, remoteY, key.Priv)
-	return secret.Bytes()
+	if remoteX == nil || remoteY == nil || remoteX.Sign() < 0 || remoteY.Sign() < 0 {
+		return nil
+	}
+	secret, err := key.SharedSecret(remoteX.Bytes(), remoteY.Bytes())
+	if err != nil {
+		return nil
+	}
+	return secret
+}
+
+// SharedSecret performs P-256 ECDH with the peer's big-endian coordinates and
+// returns the 32-byte shared x-coordinate. Points that are not on the curve
+// (or the point at infinity) are rejected: the peer controls them, and
+// elliptic's ScalarMult panics on invalid points.
+func (key *ECDHKey) SharedSecret(remoteX, remoteY []byte) ([]byte, error) {
+	if len(remoteX) == 0 || len(remoteY) == 0 || len(remoteX) > 32 || len(remoteY) > 32 {
+		return nil, errors.New("invalid ECDH public key coordinates")
+	}
+	point := make([]byte, 65)
+	point[0] = 4 // uncompressed
+	copy(point[1+32-len(remoteX):33], remoteX)
+	copy(point[33+32-len(remoteY):], remoteY)
+	peer, err := ecdh.P256().NewPublicKey(point)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ECDH public key: %w", err)
+	}
+	privateBytes := make([]byte, 32)
+	if len(key.Priv) > 32 {
+		return nil, errors.New("invalid ECDH private key")
+	}
+	copy(privateBytes[32-len(key.Priv):], key.Priv)
+	private, err := ecdh.P256().NewPrivateKey(privateBytes)
+	if err != nil {
+		return nil, err
+	}
+	return private.ECDH(peer)
 }
 
 func (key *ECDHKey) PublicKeyBytes() []byte {

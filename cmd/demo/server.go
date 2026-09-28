@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,20 +16,47 @@ import (
 	"github.com/bulwarkid/virtual-fido/fido_client"
 )
 
-func prompt(prompt string) bool {
+var stdinLines = make(chan string)
+var stdinOnce sync.Once
+
+// readStdin feeds terminal lines to prompt; reading happens in the background
+// so a prompt can be abandoned when the host cancels the request.
+func readStdin() {
 	reader := bufio.NewReader(os.Stdin)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			close(stdinLines)
+			return
+		}
+		stdinLines <- line
+	}
+}
+
+func prompt(ctx context.Context, prompt string) bool {
+	stdinOnce.Do(func() { go readStdin() })
+	// Discard anything typed before this prompt appeared.
+	for drained := false; !drained; {
+		select {
+		case <-stdinLines:
+		default:
+			drained = true
+		}
+	}
 	fmt.Println(prompt)
 	fmt.Print("--> ")
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Printf("Could not read user input: %s - %s\n", response, err)
-		panic(err)
+	select {
+	case response, ok := <-stdinLines:
+		if !ok {
+			fmt.Println("Could not read user input; denying")
+			return false
+		}
+		response = strings.ToLower(strings.TrimSpace(response))
+		return response == "y" || response == "yes"
+	case <-ctx.Done():
+		fmt.Println("\n>>> CANCELLED by the host")
+		return false
 	}
-	response = strings.ToLower(strings.TrimSpace(response))
-	if response == "y" || response == "yes" {
-		return true
-	}
-	return false
 }
 
 type ClientSupport struct {
@@ -38,12 +67,20 @@ type ClientSupport struct {
 }
 
 func (support *ClientSupport) ApproveClientAction(action fido_client.ClientAction, params fido_client.ClientActionRequestParams) bool {
+	return support.ApproveClientActionContext(context.Background(), action, params)
+}
+
+func (support *ClientSupport) ApproveClientActionContext(ctx context.Context, action fido_client.ClientAction, params fido_client.ClientActionRequestParams) bool {
+	site := params.RelyingPartyID
+	if site == "" {
+		site = params.RelyingParty
+	}
 	var description string
 	switch action {
 	case fido_client.ClientActionFIDOGetAssertion:
-		description = fmt.Sprintf("login to \"%s\" as \"%s\"", params.RelyingParty, params.UserName)
+		description = fmt.Sprintf("login to \"%s\" as \"%s\"", site, params.UserName)
 	case fido_client.ClientActionFIDOMakeCredential:
-		description = fmt.Sprintf("account creation for \"%s\"", params.RelyingParty)
+		description = fmt.Sprintf("account creation for \"%s\"", site)
 	case fido_client.ClientActionU2FAuthenticate:
 		description = "U2F authentication (login)"
 	case fido_client.ClientActionU2FRegister:
@@ -52,13 +89,31 @@ func (support *ClientSupport) ApproveClientAction(action fido_client.ClientActio
 		fmt.Printf("Unknown client action for approval: %d\n", action)
 		return false
 	}
-	return approveAction(description)
+	return approveAction(ctx, description)
 }
 
+// SaveData replaces the vault atomically (write a temporary file, then rename)
+// so a crash mid-write cannot destroy the stored credentials.
 func (support *ClientSupport) SaveData(data []byte) {
-	f, err := os.OpenFile(support.vaultFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
-	checkErr(err, "Could not open vault file")
+	dir := filepath.Dir(support.vaultFilename)
+	f, err := os.CreateTemp(dir, filepath.Base(support.vaultFilename)+".tmp-*")
+	checkErr(err, "Could not create temporary vault file")
 	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Chmod(f.Name(), 0600)
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), support.vaultFilename)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
 	checkErr(err, "Could not write vault data")
 }
 
@@ -68,6 +123,7 @@ func (support *ClientSupport) RetrieveData() []byte {
 		return nil
 	}
 	checkErr(err, "Could not open vault")
+	defer f.Close()
 	data, err := io.ReadAll(f)
 	checkErr(err, "Could not read vault data")
 	return data

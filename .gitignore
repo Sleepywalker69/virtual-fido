@@ -1,4 +1,18 @@
-vfido
-usbip
-cmd/demo/usbip
+# Build outputs
+/demo
+/demo.exe
+/vfido
+/vfido.exe
+/vfido-gui
+/vfido-gui.exe
+/dist/
 *.out
+
+# Local vaults: these hold (encrypted) private keys
+vault.json
+vault.data
+*.vault.json
+
+# OS noise
+.DS_Store
+/target

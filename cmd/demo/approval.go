@@ -57,8 +57,10 @@ func runHook(cmd string, args ...string) {
 	_ = exec.Command("sh", argv...).Run()
 }
 
-// approveAction resolves a single approval for a human-readable action.
-func approveAction(description string) bool {
+// approveAction resolves a single approval for a human-readable action. It
+// gives up (denies) as soon as ctx is cancelled, i.e. when the browser cancels
+// the request or the device is detached.
+func approveAction(ctx context.Context, description string) bool {
 	if notify := os.Getenv("VFIDO_APPROVE_NOTIFY_CMD"); notify != "" {
 		runHook(notify, "begin", description)
 		defer runHook(notify, "end", description)
@@ -66,18 +68,17 @@ func approveAction(description string) bool {
 	timeout := approvalTimeout()
 	switch {
 	case os.Getenv("VFIDO_APPROVE_CMD") != "":
-		return runApproveCmd(os.Getenv("VFIDO_APPROVE_CMD"), description, timeout)
+		return runApproveCmd(ctx, os.Getenv("VFIDO_APPROVE_CMD"), description, timeout)
 	case os.Getenv("VFIDO_APPROVE_FIFO") != "":
-		return waitFifoApproval(description, timeout)
+		return waitFifoApproval(ctx, description, timeout)
 	default:
-		return prompt(fmt.Sprintf("Approve %s (Y/n)?", description))
+		return prompt(ctx, fmt.Sprintf("Approve %s (Y/n)?", description))
 	}
 }
 
 // runApproveCmd runs an external approval command; exit 0 within the timeout
 // approves.
-func runApproveCmd(cmd, description string, timeout time.Duration) bool {
-	ctx := context.Background()
+func runApproveCmd(ctx context.Context, cmd, description string, timeout time.Duration) bool {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -87,7 +88,11 @@ func runApproveCmd(cmd, description string, timeout time.Duration) bool {
 	c := exec.CommandContext(ctx, "sh", "-c", cmd+` "$@"`, "sh", description)
 	c.Env = append(os.Environ(), "VFIDO_APPROVE_ACTION="+description)
 	if err := c.Run(); err != nil {
-		fmt.Printf(">>> DENIED (%v)\n", err)
+		if ctx.Err() == context.Canceled {
+			fmt.Println(">>> CANCELLED by the host")
+		} else {
+			fmt.Printf(">>> DENIED (%v)\n", err)
+		}
 		return false
 	}
 	fmt.Println(">>> APPROVED")
@@ -131,7 +136,7 @@ func startApprovalListener() {
 
 // waitFifoApproval drains any stale presses, then waits for a fresh "y" or the
 // timeout. A timeout of 0 waits indefinitely.
-func waitFifoApproval(description string, timeout time.Duration) bool {
+func waitFifoApproval(ctx context.Context, description string, timeout time.Duration) bool {
 	for {
 		select {
 		case <-approvalCh:
@@ -151,6 +156,9 @@ func waitFifoApproval(description string, timeout time.Duration) bool {
 		return true
 	case <-timer:
 		fmt.Println(">>> DENIED (timeout, no approval)")
+		return false
+	case <-ctx.Done():
+		fmt.Println(">>> CANCELLED by the host")
 		return false
 	}
 }

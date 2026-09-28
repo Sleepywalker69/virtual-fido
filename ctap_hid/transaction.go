@@ -50,7 +50,7 @@ func newCTAPHIDTransaction(message []byte) *ctapHIDTransaction {
 		transaction.result.payload = transaction.result.payload[:transaction.result.header.PayloadLength]
 		transaction.finish()
 	} else {
-		ctapHIDLogger.Printf("CTAPHID: Read %d bytes, Need %d more\n\n",
+		ctapHIDTraceLogger.Printf("CTAPHID: Read %d bytes, Need %d more\n\n",
 			len(transaction.result.payload),
 			int(payloadLength)-len(transaction.result.payload))
 	}
@@ -87,7 +87,7 @@ func (transaction *ctapHIDTransaction) addMessage(message []byte) {
 		transaction.finish()
 	} else {
 		// We need another followup message
-		ctapHIDLogger.Printf("CTAPHID: Read %d bytes, Need %d more\n\n",
+		ctapHIDTraceLogger.Printf("CTAPHID: Read %d bytes, Need %d more\n\n",
 			len(transaction.result.payload),
 			int(transaction.result.header.PayloadLength)-len(transaction.result.payload))
 		transaction.result.sequenceNumber += 1

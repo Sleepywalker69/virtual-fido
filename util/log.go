@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"log"
+	"sync"
 )
 
 var logLog = NewLogger("[LOG] ", LogLevelEnabled)
@@ -17,32 +18,44 @@ const (
 	LogLevelEnabled LogLevel = 3
 )
 
-// Not sure if there is a standard library way to do this,
-// but I couldn't find any at the moment
+// maxBufferedLog bounds how much output a level keeps while it has no
+// destination yet. Trace output is produced for every USB packet, so an
+// unbounded buffer grows for as long as the process runs.
+const maxBufferedLog = 256 * 1024
+
+// logBuffer holds log output until a destination is configured and then
+// forwards to it. Every logger of one level shares a logBuffer, so it must be
+// safe for concurrent use.
 type logBuffer struct {
-	buffer *bytes.Buffer
+	mu     sync.Mutex
+	buffer bytes.Buffer
 	output io.Writer
 }
 
 func newLogBuffer() *logBuffer {
-	return &logBuffer{
-		buffer: new(bytes.Buffer),
-		output: nil,
-	}
+	return &logBuffer{}
 }
 
 func (logBuf *logBuffer) Write(p []byte) (n int, err error) {
-	if logBuf.output == nil {
-		return logBuf.buffer.Write(p)
-	} else {
-		return logBuf.output.Write(p)
+	logBuf.mu.Lock()
+	output := logBuf.output
+	if output == nil {
+		if logBuf.buffer.Len()+len(p) <= maxBufferedLog {
+			logBuf.buffer.Write(p)
+		}
+		logBuf.mu.Unlock()
+		return len(p), nil
 	}
+	logBuf.mu.Unlock()
+	return output.Write(p)
 }
 
 func (logBuf *logBuffer) setOutput(output io.Writer) {
+	logBuf.mu.Lock()
+	defer logBuf.mu.Unlock()
 	if logBuf.buffer.Len() > 0 {
-		b, _ := io.ReadAll(logBuf.buffer)
-		output.Write(b)
+		output.Write(logBuf.buffer.Bytes())
+		logBuf.buffer.Reset()
 	}
 	logBuf.output = output
 }
@@ -56,16 +69,19 @@ func SetLogOutput(out io.Writer) {
 	enabledLogOutput.setOutput(out)
 }
 
+// SetLogLevel routes every level at or above level to the log output and
+// discards the rest.
 func SetLogLevel(level LogLevel) {
-	if level <= LogLevelUnsafe {
-		unsafeLogOutput.setOutput(traceLogOutput)
+	route := func(buf *logBuffer, bufLevel LogLevel, next io.Writer) {
+		if level <= bufLevel {
+			buf.setOutput(next)
+		} else {
+			buf.setOutput(io.Discard)
+		}
 	}
-	if level <= LogLevelTrace {
-		traceLogOutput.setOutput(debugLogOutput)
-	}
-	if level <= LogLevelDebug {
-		debugLogOutput.setOutput(enabledLogOutput)
-	}
+	route(unsafeLogOutput, LogLevelUnsafe, traceLogOutput)
+	route(traceLogOutput, LogLevelTrace, debugLogOutput)
+	route(debugLogOutput, LogLevelDebug, enabledLogOutput)
 	logLog.Printf("Log Level Set: %d\n", level)
 }
 

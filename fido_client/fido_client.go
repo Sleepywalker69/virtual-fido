@@ -1,9 +1,12 @@
 package fido_client
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
+	"fmt"
 	"log"
+	"sync"
 
 	"github.com/bulwarkid/virtual-fido/cose"
 	"github.com/bulwarkid/virtual-fido/crypto"
@@ -15,8 +18,11 @@ import (
 type ClientAction uint8
 
 type ClientActionRequestParams struct {
-	RelyingParty string
-	UserName     string
+	// RelyingPartyID is the site's domain as vouched for by the browser; show
+	// this to the user. RelyingParty is the display name the site chose.
+	RelyingPartyID string
+	RelyingParty   string
+	UserName       string
 }
 
 const (
@@ -27,10 +33,19 @@ const (
 	ClientActionManageAuthenticator ClientAction = 4
 )
 
+const defaultPINRetries = 8
+
 var clientLogger *log.Logger = util.NewLogger("[CLIENT] ", util.LogLevelDebug)
 
 type ClientRequestApprover interface {
 	ApproveClientAction(action ClientAction, params ClientActionRequestParams) bool
+}
+
+// ContextRequestApprover is an optional extension of ClientRequestApprover for
+// approvers that can withdraw their prompt when the request is cancelled (the
+// browser gave up, or the device was detached).
+type ContextRequestApprover interface {
+	ApproveClientActionContext(ctx context.Context, action ClientAction, params ClientActionRequestParams) bool
 }
 
 type UserVerifier interface {
@@ -44,7 +59,12 @@ type ClientDataSaver interface {
 	Passphrase() string
 }
 
+// DefaultFIDOClient holds the authenticator's state: credentials, PIN and
+// attestation keys. It is safe for concurrent use, so an app can manage
+// credentials while the authenticator is serving requests.
 type DefaultFIDOClient struct {
+	mu sync.Mutex
+
 	deviceEncryptionKey   []byte
 	certificateAuthority  *x509.Certificate
 	certPrivateKey        *cose.SupportedCOSEPrivateKey
@@ -63,6 +83,9 @@ type DefaultFIDOClient struct {
 	dataSaver       ClientDataSaver
 }
 
+// NewDefaultClient creates a client and loads any saved state, panicking if
+// the saved state cannot be decrypted. LoadDefaultClient reports that as an
+// error instead.
 func NewDefaultClient(
 	rootAttestationCertificate *x509.Certificate,
 	rootAttestationCertPrivateKey *cose.SupportedCOSEPrivateKey,
@@ -71,6 +94,22 @@ func NewDefaultClient(
 	requestApprover ClientRequestApprover,
 	userVerifier UserVerifier,
 	dataSaver ClientDataSaver) *DefaultFIDOClient {
+	client, err := LoadDefaultClient(rootAttestationCertificate, rootAttestationCertPrivateKey, secretEncryptionKey, enablePIN, requestApprover, userVerifier, dataSaver)
+	util.CheckErr(err, "Could not load vault data")
+	return client
+}
+
+// LoadDefaultClient creates a client and loads its saved state. The defaults
+// passed in (attestation CA, encryption key, PIN enabled) only apply when there
+// is no saved state yet.
+func LoadDefaultClient(
+	rootAttestationCertificate *x509.Certificate,
+	rootAttestationCertPrivateKey *cose.SupportedCOSEPrivateKey,
+	secretEncryptionKey [32]byte,
+	enablePIN bool,
+	requestApprover ClientRequestApprover,
+	userVerifier UserVerifier,
+	dataSaver ClientDataSaver) (*DefaultFIDOClient, error) {
 	if userVerifier == nil {
 		userVerifier = &noopUserVerifier{}
 	}
@@ -83,7 +122,7 @@ func NewDefaultClient(
 		// CTAP2 spec: pinUvAuthToken length is 32 bytes for v1/v2
 		pinToken:           crypto.RandomBytes(32),
 		pinKeyAgreement:    crypto.GenerateECDHKey(),
-		pinRetries:         8,
+		pinRetries:         defaultPINRetries,
 		pinHash:            nil,
 		fingerprintEnabled: false,
 		vault:              identities.NewIdentityVault(),
@@ -91,8 +130,12 @@ func NewDefaultClient(
 		userVerifier:       userVerifier,
 		dataSaver:          dataSaver,
 	}
-	client.loadData()
-	return client
+	if data := dataSaver.RetrieveData(); data != nil {
+		if err := client.importData(data, dataSaver.Passphrase()); err != nil {
+			return nil, err
+		}
+	}
+	return client, nil
 }
 
 func (client *DefaultFIDOClient) SupportsResidentKey() bool {
@@ -131,12 +174,16 @@ func (client *DefaultFIDOClient) NewCredentialSource(
 		}
 		return eph
 	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	newSource := client.vault.NewIdentity(relyingParty, user)
-	client.saveData()
+	client.saveDataLocked()
 	return newSource
 }
 
 func (client *DefaultFIDOClient) GetAssertionSource(relyingPartyID string, allowList []webauthn.PublicKeyCredentialDescriptor) *identities.CredentialSource {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	sources := client.vault.GetMatchingCredentialSources(relyingPartyID, allowList)
 	if len(sources) == 0 {
 		clientLogger.Printf("ERROR: No Credentials\n\n")
@@ -146,11 +193,13 @@ func (client *DefaultFIDOClient) GetAssertionSource(relyingPartyID string, allow
 	// TODO: Allow user to choose credential source
 	credentialSource := sources[0]
 	credentialSource.SignatureCounter++
-	client.saveData()
+	client.saveDataLocked()
 	return credentialSource
 }
 
 func (client *DefaultFIDOClient) GetAssertionSources(relyingPartyID string, allowList []webauthn.PublicKeyCredentialDescriptor) []*identities.CredentialSource {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	sources := client.vault.GetMatchingCredentialSources(relyingPartyID, allowList)
 	if len(sources) == 0 {
 		return []*identities.CredentialSource{}
@@ -162,19 +211,59 @@ func (client *DefaultFIDOClient) GetAssertionSources(relyingPartyID string, allo
 	return sources
 }
 
-func (client DefaultFIDOClient) ApproveAccountCreation(relyingParty string) bool {
+// UpdateCredential applies update to credential state (counters, flags) under
+// the client's lock and saves the result.
+func (client *DefaultFIDOClient) UpdateCredential(update func()) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	update()
+	client.saveDataLocked()
+}
+
+func (client *DefaultFIDOClient) ApproveAccountCreation(relyingParty string) bool {
 	params := ClientActionRequestParams{
 		RelyingParty: relyingParty,
 	}
-	return client.requestApprover.ApproveClientAction(ClientActionFIDOMakeCredential, params)
+	return client.approve(context.Background(), ClientActionFIDOMakeCredential, params)
 }
 
-func (client DefaultFIDOClient) ApproveAccountLogin(credentialSource *identities.CredentialSource) bool {
-	params := ClientActionRequestParams{
-		RelyingParty: credentialSource.RelyingParty.Name,
-		UserName:     credentialSource.User.Name,
+func (client *DefaultFIDOClient) ApproveAccountLogin(credentialSource *identities.CredentialSource) bool {
+	return client.ApproveAccountLoginContext(context.Background(), credentialSource)
+}
+
+// ApproveAccountCreationContext asks the user to approve a new credential; the
+// prompt is withdrawn if ctx is cancelled.
+func (client *DefaultFIDOClient) ApproveAccountCreationContext(ctx context.Context, relyingParty *webauthn.PublicKeyCredentialRPEntity, user *webauthn.PublicKeyCrendentialUserEntity) bool {
+	params := ClientActionRequestParams{}
+	if relyingParty != nil {
+		params.RelyingPartyID = relyingParty.ID
+		params.RelyingParty = relyingParty.Name
 	}
-	return client.requestApprover.ApproveClientAction(ClientActionFIDOGetAssertion, params)
+	if user != nil {
+		params.UserName = user.Name
+	}
+	return client.approve(ctx, ClientActionFIDOMakeCredential, params)
+}
+
+// ApproveAccountLoginContext asks the user to approve a sign-in; the prompt is
+// withdrawn if ctx is cancelled.
+func (client *DefaultFIDOClient) ApproveAccountLoginContext(ctx context.Context, credentialSource *identities.CredentialSource) bool {
+	params := ClientActionRequestParams{}
+	if credentialSource.RelyingParty != nil {
+		params.RelyingPartyID = credentialSource.RelyingParty.ID
+		params.RelyingParty = credentialSource.RelyingParty.Name
+	}
+	if credentialSource.User != nil {
+		params.UserName = credentialSource.User.Name
+	}
+	return client.approve(ctx, ClientActionFIDOGetAssertion, params)
+}
+
+func (client *DefaultFIDOClient) approve(ctx context.Context, action ClientAction, params ClientActionRequestParams) bool {
+	if approver, ok := client.requestApprover.(ContextRequestApprover); ok {
+		return approver.ApproveClientActionContext(ctx, action, params)
+	}
+	return client.requestApprover.ApproveClientAction(action, params)
 }
 
 // -----------------------
@@ -182,31 +271,57 @@ func (client DefaultFIDOClient) ApproveAccountLogin(credentialSource *identities
 // -----------------------
 
 func (client *DefaultFIDOClient) EnablePIN() {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.pinEnabled = true
-	client.saveData()
+	client.saveDataLocked()
 }
 
 func (client *DefaultFIDOClient) DisablePIN() {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.pinEnabled = false
-	client.saveData()
+	client.saveDataLocked()
 }
 
 func (client *DefaultFIDOClient) SupportsPIN() bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	return client.pinEnabled
 }
 
 func (client *DefaultFIDOClient) PINHash() []byte {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	return client.pinHash
 }
 
+// SetPIN sets (or replaces) the PIN directly, resets the retry counter and
+// invalidates issued PIN tokens.
 func (client *DefaultFIDOClient) SetPIN(pin []byte) {
-	pinHash := crypto.HashSHA256(pin)[:16]
-	client.SetPINHash(pinHash)
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.pinHash = crypto.HashSHA256(pin)[:16]
+	client.pinRetries = defaultPINRetries
+	client.pinToken = crypto.RandomBytes(32)
+	client.saveDataLocked()
+}
+
+// ClearPIN removes the PIN (the recovery path when it is forgotten or blocked).
+func (client *DefaultFIDOClient) ClearPIN() {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.pinHash = nil
+	client.pinRetries = defaultPINRetries
+	client.pinToken = crypto.RandomBytes(32)
+	client.saveDataLocked()
 }
 
 func (client *DefaultFIDOClient) SetPINHash(newHash []byte) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.pinHash = newHash
-	client.saveData()
+	client.saveDataLocked()
 }
 
 // ---------------------------
@@ -214,6 +329,8 @@ func (client *DefaultFIDOClient) SetPINHash(newHash []byte) {
 // ---------------------------
 
 func (client *DefaultFIDOClient) FingerprintEnabled() bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	return client.fingerprintEnabled
 }
 
@@ -225,17 +342,21 @@ func (client *DefaultFIDOClient) FingerprintAvailable() bool {
 }
 
 func (client *DefaultFIDOClient) EnableFingerprint() {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.fingerprintEnabled = true
-	client.saveData()
+	client.saveDataLocked()
 }
 
 func (client *DefaultFIDOClient) DisableFingerprint() {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.fingerprintEnabled = false
-	client.saveData()
+	client.saveDataLocked()
 }
 
 func (client *DefaultFIDOClient) SupportsUserVerification() bool {
-	if !client.fingerprintEnabled {
+	if !client.FingerprintEnabled() {
 		return false
 	}
 	return client.FingerprintAvailable()
@@ -249,44 +370,68 @@ func (client *DefaultFIDOClient) VerifyUser(action ClientAction, params ClientAc
 }
 
 func (client *DefaultFIDOClient) PINRetries() int32 {
-	// pinRetries may legitimately reach 0 (PIN blocked); only assert the upper bound
-	// — asserting > 0 made every PINRetries() call panic once the PIN was blocked.
-	util.Assert(client.pinRetries >= 0 && client.pinRetries <= 8, "Invalid PIN Retries")
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	return client.pinRetries
 }
 
+// SetPINRetries updates the retry counter; it is persisted so a restart does
+// not reset it.
 func (client *DefaultFIDOClient) SetPINRetries(retries int32) {
+	if retries < 0 {
+		retries = 0
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.pinRetries == retries {
+		return
+	}
 	client.pinRetries = retries
+	client.saveDataLocked()
 }
 
 func (client *DefaultFIDOClient) PINKeyAgreement() *crypto.ECDHKey {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	return client.pinKeyAgreement
 }
 
 // RotatePINKeyAgreement generates a fresh ephemeral ECDH key for the next PIN protocol exchange.
 func (client *DefaultFIDOClient) RotatePINKeyAgreement() {
-	client.pinKeyAgreement = crypto.GenerateECDHKey()
+	key := crypto.GenerateECDHKey()
+	client.mu.Lock()
+	client.pinKeyAgreement = key
+	client.mu.Unlock()
 }
 
 func (client *DefaultFIDOClient) PINToken() []byte {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	return client.pinToken
 }
 
 // RotatePINToken generates a fresh pinUvAuthToken, invalidating any previously
 // issued tokens (e.g. after a PIN set/change so old tokens can no longer be used).
 func (client *DefaultFIDOClient) RotatePINToken() {
-	client.pinToken = crypto.RandomBytes(32)
+	token := crypto.RandomBytes(32)
+	client.mu.Lock()
+	client.pinToken = token
+	client.mu.Unlock()
 }
 
 func (client *DefaultFIDOClient) SaveState() {
-	client.saveData()
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.saveDataLocked()
 }
 
 // -----------------------------
 // U2F Methods
 // -----------------------------
 
-func (client DefaultFIDOClient) SealingEncryptionKey() []byte {
+func (client *DefaultFIDOClient) SealingEncryptionKey() []byte {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	return client.deviceEncryptionKey
 }
 
@@ -295,30 +440,37 @@ func (client *DefaultFIDOClient) NewPrivateKey() *ecdsa.PrivateKey {
 }
 
 func (client *DefaultFIDOClient) NewAuthenticationCounterId() uint32 {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	num := client.authenticationCounter
 	client.authenticationCounter++
+	client.saveDataLocked()
 	return num
 }
 
 func (client *DefaultFIDOClient) CreateAttestationCertificiate(privateKey *cose.SupportedCOSEPrivateKey) []byte {
-	cert, err := identities.CreateSelfSignedAttestationCertificate(client.certificateAuthority, client.certPrivateKey, privateKey)
+	client.mu.Lock()
+	ca, caKey := client.certificateAuthority, client.certPrivateKey
+	client.mu.Unlock()
+	cert, err := identities.CreateSelfSignedAttestationCertificate(ca, caKey, privateKey)
 	util.CheckErr(err, "Could not create attestation certificate")
 	return cert.Raw
 }
 
-func (client DefaultFIDOClient) ApproveU2FRegistration(keyHandle *webauthn.KeyHandle) bool {
+func (client *DefaultFIDOClient) ApproveU2FRegistration(keyHandle *webauthn.KeyHandle) bool {
 	params := ClientActionRequestParams{}
-	return client.requestApprover.ApproveClientAction(ClientActionU2FRegister, params)
+	return client.approve(context.Background(), ClientActionU2FRegister, params)
 }
 
-func (client DefaultFIDOClient) ApproveU2FAuthentication(keyHandle *webauthn.KeyHandle) bool {
+func (client *DefaultFIDOClient) ApproveU2FAuthentication(keyHandle *webauthn.KeyHandle) bool {
 	params := ClientActionRequestParams{}
-	return client.requestApprover.ApproveClientAction(ClientActionU2FAuthenticate, params)
+	return client.approve(context.Background(), ClientActionU2FAuthenticate, params)
 }
 
-func (client *DefaultFIDOClient) exportData(passphrase string) []byte {
+func (client *DefaultFIDOClient) exportDataLocked(passphrase string) []byte {
 	privKeyBytes := cose.MarshalCOSEPrivateKey(client.certPrivateKey)
 	identityData := client.vault.Export()
+	retries := client.pinRetries
 	state := identities.FIDODeviceConfig{
 		EncryptionKey:          client.deviceEncryptionKey,
 		AttestationCertificate: client.certificateAuthority.Raw,
@@ -326,6 +478,7 @@ func (client *DefaultFIDOClient) exportData(passphrase string) []byte {
 		AuthenticationCounter:  client.authenticationCounter,
 		PINEnabled:             client.pinEnabled,
 		PINHash:                client.pinHash,
+		PINRetries:             &retries,
 		FingerprintEnabled:     client.fingerprintEnabled,
 		Sources:                identityData,
 	}
@@ -336,40 +489,50 @@ func (client *DefaultFIDOClient) exportData(passphrase string) []byte {
 
 func (client *DefaultFIDOClient) importData(data []byte, passphrase string) error {
 	state, err := identities.DecryptFIDOState(data, passphrase)
-	util.CheckErr(err, "Could not decrypt vault data")
+	if err != nil {
+		return fmt.Errorf("could not decrypt vault data: %w", err)
+	}
 	cert, err := x509.ParseCertificate(state.AttestationCertificate)
-	util.CheckErr(err, "Could not parse x509 cert")
+	if err != nil {
+		return fmt.Errorf("could not parse attestation certificate: %w", err)
+	}
 	privateKey, err := cose.UnmarshalCOSEPrivateKey(state.AttestationPrivateKey)
 	if err != nil {
 		privateKeyECDSA, err := x509.ParseECPrivateKey(state.AttestationPrivateKey)
-		util.CheckErr(err, "Could not parse private key")
+		if err != nil {
+			return fmt.Errorf("could not parse attestation private key: %w", err)
+		}
 		privateKey = &cose.SupportedCOSEPrivateKey{ECDSA: privateKeyECDSA}
 	}
+	vault := identities.NewIdentityVault()
+	if err := vault.Import(state.Sources); err != nil {
+		return err
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.deviceEncryptionKey = state.EncryptionKey
 	client.certificateAuthority = cert
 	client.certPrivateKey = privateKey
 	client.authenticationCounter = state.AuthenticationCounter
 	client.pinEnabled = state.PINEnabled
 	client.pinHash = state.PINHash
+	if state.PINRetries != nil {
+		client.pinRetries = *state.PINRetries
+	}
 	client.fingerprintEnabled = state.FingerprintEnabled
-	client.vault = identities.NewIdentityVault()
-	client.vault.Import(state.Sources)
+	client.vault = vault
 	return nil
 }
 
-func (client *DefaultFIDOClient) saveData() {
-	data := client.exportData(client.dataSaver.Passphrase())
+func (client *DefaultFIDOClient) saveDataLocked() {
+	data := client.exportDataLocked(client.dataSaver.Passphrase())
 	client.dataSaver.SaveData(data)
 }
 
-func (client *DefaultFIDOClient) loadData() {
-	data := client.dataSaver.RetrieveData()
-	if data != nil {
-		client.importData(data, client.dataSaver.Passphrase())
-	}
-}
-
+// Identities returns a snapshot of the stored credentials.
 func (client *DefaultFIDOClient) Identities() []identities.CredentialSource {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	sources := make([]identities.CredentialSource, 0)
 	for _, source := range client.vault.CredentialSources {
 		sources = append(sources, *source)
@@ -378,9 +541,11 @@ func (client *DefaultFIDOClient) Identities() []identities.CredentialSource {
 }
 
 func (client *DefaultFIDOClient) DeleteIdentity(id []byte) bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	success := client.vault.DeleteIdentity(id)
 	if success {
-		client.saveData()
+		client.saveDataLocked()
 	}
 	return success
 }

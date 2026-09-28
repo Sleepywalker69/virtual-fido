@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	"github.com/bulwarkid/virtual-fido/crypto"
-	"github.com/bulwarkid/virtual-fido/util"
 	"github.com/bulwarkid/virtual-fido/webauthn"
 
 	"golang.org/x/crypto/scrypt"
@@ -20,6 +19,9 @@ type SavedCredentialSource struct {
 	User             webauthn.PublicKeyCrendentialUserEntity `json:"user"`
 	SignatureCounter int32                                   `json:"signature_counter"`
 	CredRandom       []byte                                  `json:"cred_random,omitempty"`
+	// NotDiscoverable is stored inverted so credentials saved before the flag
+	// existed keep their old (discoverable) behaviour.
+	NotDiscoverable bool `json:"not_discoverable,omitempty"`
 }
 
 type FIDODeviceConfig struct {
@@ -29,6 +31,7 @@ type FIDODeviceConfig struct {
 	AuthenticationCounter  uint32                  `json:"authentication_counter"`
 	PINEnabled             bool                    `json:"pin_enabled,omitempty"`
 	PINHash                []byte                  `json:"pin_hash,omitempty"`
+	PINRetries             *int32                  `json:"pin_retries,omitempty"`
 	FingerprintEnabled     bool                    `json:"fingerprint_enabled,omitempty"`
 	Sources                []SavedCredentialSource `json:"sources"`
 }
@@ -105,15 +108,18 @@ func DecryptWithPassphrase(passphrase string, data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("Could not unmarshal JSON into encrypted data: %w", err)
 	}
 	keyEncryptionKey, err := scrypt.Key([]byte(passphrase), blob.Salt, scryptN, scryptR, scryptP, scryptKeyLen)
-	util.CheckErr(err, "Could not create key encryption key")
-	// Warm the cache so subsequent saves reuse this KEK/salt without re-deriving.
+	if err != nil {
+		return nil, fmt.Errorf("Could not create key encryption key: %w", err)
+	}
+	encryptionKey, err := crypto.Decrypt(keyEncryptionKey, blob.EncryptionKey, blob.KeyNonce)
+	if err != nil {
+		return nil, fmt.Errorf("Could not decrypt encryption key (wrong passphrase?): %w", err)
+	}
+	// Warm the cache so subsequent saves reuse this KEK/salt without re-deriving
+	// (only once the passphrase is known to be right).
 	kekCache.mu.Lock()
 	kekCache.passphrase, kekCache.salt, kekCache.kek = passphrase, blob.Salt, keyEncryptionKey
 	kekCache.mu.Unlock()
-	encryptionKey, err := crypto.Decrypt(keyEncryptionKey, blob.EncryptionKey, blob.KeyNonce)
-	if err != nil {
-		return nil, fmt.Errorf("Could not decrypt encryption key: %w", err)
-	}
 	decryptedData, err := crypto.Decrypt(encryptionKey, blob.EncryptedData, blob.DataNonce)
 	if err != nil {
 		return nil, fmt.Errorf("Could not decrypt data: %w", err)

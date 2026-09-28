@@ -1,12 +1,15 @@
 package ctap
 
 import (
+	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bulwarkid/virtual-fido/cose"
 	"github.com/bulwarkid/virtual-fido/crypto"
@@ -57,12 +60,15 @@ const (
 	ctap1ErrTimeout          ctapStatusCode = 0x05
 	ctap1ErrChannelBusy      ctapStatusCode = 0x06
 
-	ctap2ErrUnsupportedAlgorithm ctapStatusCode = 0x26
 	ctap2ErrInvalidCBOR          ctapStatusCode = 0x12
-	ctap2ErrNoCredentials        ctapStatusCode = 0x2E
-	ctap2ErrOperationDenied      ctapStatusCode = 0x27
 	ctap2ErrMissingParam         ctapStatusCode = 0x14
-	ctap2ErrInvalidSubcommand    ctapStatusCode = 0x2C
+	ctap2ErrCredentialExcluded   ctapStatusCode = 0x19
+	ctap2ErrUnsupportedAlgorithm ctapStatusCode = 0x26
+	ctap2ErrOperationDenied      ctapStatusCode = 0x27
+	ctap2ErrInvalidOption        ctapStatusCode = 0x2C
+	ctap2ErrKeepaliveCancel      ctapStatusCode = 0x2D
+	ctap2ErrNoCredentials        ctapStatusCode = 0x2E
+	ctap2ErrNotAllowed           ctapStatusCode = 0x30
 	ctap2ErrPINInvalid           ctapStatusCode = 0x31
 	ctap2ErrPINBlocked           ctapStatusCode = 0x32
 	ctap2ErrPINAuthInvalid       ctapStatusCode = 0x33
@@ -71,6 +77,13 @@ const (
 	ctap2ErrPINRequired          ctapStatusCode = 0x36
 	ctap2ErrPINPolicyViolation   ctapStatusCode = 0x37
 	ctap2ErrPINExpired           ctapStatusCode = 0x38
+	ctap2ErrInvalidSubcommand    ctapStatusCode = 0x3E
+	ctap1ErrOther                ctapStatusCode = 0x7F
+)
+
+const (
+	pinMaxRetries      = 8
+	pinMaxBootFailures = 3
 )
 
 type CTAPClient interface {
@@ -105,54 +118,98 @@ type CTAPClient interface {
 	ApproveAccountLogin(credentialSource *identities.CredentialSource) bool
 }
 
+// ContextApprover is implemented by clients whose approval prompts can be
+// withdrawn when the host cancels, and that want the full relying party (its
+// ID is the domain the browser vouches for).
+type ContextApprover interface {
+	ApproveAccountCreationContext(ctx context.Context, relyingParty *webauthn.PublicKeyCredentialRPEntity, user *webauthn.PublicKeyCrendentialUserEntity) bool
+	ApproveAccountLoginContext(ctx context.Context, credentialSource *identities.CredentialSource) bool
+}
+
+// credentialDeleter lets MakeCredential replace an older discoverable
+// credential for the same account instead of accumulating duplicates.
+type credentialDeleter interface {
+	DeleteIdentity(id []byte) bool
+}
+
+// credentialUpdater lets the client apply credential changes under its own lock.
+type credentialUpdater interface {
+	UpdateCredential(update func())
+}
+
 type CTAPServer struct {
 	client CTAPClient
-	// mu serializes all CTAP message handling. A real authenticator processes one
-	// command at a time, and the USB/HID layer dispatches each message in its own
-	// goroutine, so this guards currentChannelID and the per-channel maps below
-	// against concurrent read/write (which would otherwise crash the process).
+	// mu serializes CTAP message handling: an authenticator processes one
+	// command at a time.
 	mu sync.Mutex
+	// ctx and currentChannelID describe the request being handled (guarded by mu).
+	ctx              context.Context
+	currentChannelID uint32
 	// per-channel assertion sessions for GetNextAssertion
 	assertionSessions map[uint32]*assertionSession
-	currentChannelID  uint32
-	// per-channel PIN key agreement sessions for ClientPIN flows
-	pinSessions map[uint32]*pinSession
-	// per-channel pinUvAuthToken (plaintext) issued most recently
-	pinTokenByChannel map[uint32][]byte
 	// pinBootFailures counts consecutive wrong-PIN attempts this power cycle; at
 	// pinMaxBootFailures the authenticator refuses further PIN auth until restart.
 	pinBootFailures uint8
+	// pinTokenIssued records that the current pinUvAuthToken was handed out via
+	// getPINToken since it was last rotated.
+	pinTokenIssued bool
+	// userPresenceNeeded is set while waiting for the user's approval, so the
+	// transport can report STATUS_UPNEEDED in keepalives.
+	userPresenceNeeded atomic.Bool
 }
 
 func NewCTAPServer(client CTAPClient) *CTAPServer {
 	return &CTAPServer{
 		client:            client,
 		assertionSessions: make(map[uint32]*assertionSession),
-		pinSessions:       make(map[uint32]*pinSession),
-		pinTokenByChannel: make(map[uint32][]byte),
 	}
 }
 
-// Optional: allow HID layer to pass channel context
-func (server *CTAPServer) HandleMessageForChannel(channelID uint32, data []byte) []byte {
+// HandleMessageContext handles one CTAP request. Cancelling ctx withdraws any
+// pending approval prompt and makes the request fail with KEEPALIVE_CANCEL.
+func (server *CTAPServer) HandleMessageContext(ctx context.Context, channelID uint32, data []byte) []byte {
 	server.mu.Lock()
 	defer server.mu.Unlock()
+	server.ctx = ctx
 	server.currentChannelID = channelID
-	ctapLogger.Printf("CTAP: using channel 0x%x for this request\n\n", channelID)
-	defer func() { server.currentChannelID = 0 }()
+	defer func() {
+		server.ctx = nil
+		server.currentChannelID = 0
+	}()
 	return server.dispatch(data)
 }
 
+func (server *CTAPServer) HandleMessageForChannel(channelID uint32, data []byte) []byte {
+	return server.HandleMessageContext(context.Background(), channelID, data)
+}
+
 func (server *CTAPServer) HandleMessage(data []byte) []byte {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-	return server.dispatch(data)
+	return server.HandleMessageContext(context.Background(), 0, data)
+}
+
+// UserPresenceNeeded reports whether a request is waiting for the user.
+func (server *CTAPServer) UserPresenceNeeded() bool {
+	return server.userPresenceNeeded.Load()
+}
+
+func (server *CTAPServer) requestContext() context.Context {
+	if server.ctx != nil {
+		return server.ctx
+	}
+	return context.Background()
 }
 
 // dispatch runs the command switch; callers must hold server.mu.
 func (server *CTAPServer) dispatch(data []byte) []byte {
+	if len(data) == 0 {
+		return []byte{byte(ctap1ErrInvalidLength)}
+	}
 	command := ctapCommand(data[0])
 	ctapLogger.Printf("CTAP COMMAND: %s\n\n", ctapCommandDescriptions[command])
+	if command != ctapCommandGetNextAssertion {
+		// GetNextAssertion is only valid right after GetAssertion.
+		delete(server.assertionSessions, server.currentChannelID)
+	}
 	switch command {
 	case ctapCommandMakeCredential:
 		return server.handleMakeCredential(data[1:])
@@ -168,7 +225,6 @@ func (server *CTAPServer) dispatch(data []byte) []byte {
 		// CTAP2.1 authenticatorSelection requires only a success status and no CBOR payload.
 		return []byte{byte(ctap1ErrSuccess)}
 	default:
-		// Return a proper error instead of panicking on unknown commands.
 		ctapLogger.Printf("Invalid CTAP Command: %d\n\n", command)
 		return []byte{byte(ctap1ErrInvalidCommand)}
 	}
@@ -213,13 +269,7 @@ func makeAttestedCredentialData(credentialSource *identities.CredentialSource) [
 }
 
 func makeAuthData(rpID string, credentialSource *identities.CredentialSource, attestedCredentialData []byte, flags authDataFlags) []byte {
-	if attestedCredentialData != nil {
-		flags = flags | authDataFlagAttestedDataIncluded
-	} else {
-		attestedCredentialData = []byte{}
-	}
-	rpIdHash := sha256.Sum256([]byte(rpID))
-	return util.Concat(rpIdHash[:], []byte{uint8(flags)}, util.ToBE(credentialSource.SignatureCounter), attestedCredentialData)
+	return makeAuthDataWithExtensions(rpID, credentialSource, attestedCredentialData, flags, nil)
 }
 
 func makeAuthDataWithExtensions(rpID string, credentialSource *identities.CredentialSource, attestedCredentialData []byte, flags authDataFlags, extensions []byte) []byte {
@@ -232,11 +282,7 @@ func makeAuthDataWithExtensions(rpID string, credentialSource *identities.Creden
 		flags = flags | authDataFlagExtensionDataIncluded
 	}
 	rpIdHash := sha256.Sum256([]byte(rpID))
-	base := util.Concat(rpIdHash[:], []byte{uint8(flags)}, util.ToBE(credentialSource.SignatureCounter), attestedCredentialData)
-	if len(extensions) > 0 {
-		base = util.Concat(base, extensions)
-	}
-	return base
+	return util.Concat(rpIdHash[:], []byte{uint8(flags)}, util.ToBE(credentialSource.SignatureCounter), attestedCredentialData, extensions)
 }
 
 type makeCredentialOptions struct {
@@ -277,22 +323,21 @@ type makeCredentialResponse struct {
 	AttestationStatement basicAttestationStatement `cbor:"3,keyasint"`
 }
 
+func status(code ctapStatusCode) []byte {
+	return []byte{byte(code)}
+}
+
 func (server *CTAPServer) handleMakeCredential(data []byte) []byte {
 	var args makeCredentialArgs
-	err := cbor.Unmarshal(data, &args)
-	util.CheckErr(err, fmt.Sprintf("Could not decode CBOR for MAKE_CREDENTIAL: %s %v", err, data))
-	// Normalize empty pinUvAuthParam (empty bstr) to nil for semantics
-	if args.PINUVAuthParam != nil && len(args.PINUVAuthParam) == 0 {
-		args.PINUVAuthParam = nil
+	if err := cbor.Unmarshal(data, &args); err != nil {
+		ctapLogger.Printf("ERROR: invalid MakeCredential CBOR: %v\n\n", err)
+		return status(ctap2ErrInvalidCBOR)
 	}
 	ctapLogger.Printf("MAKE CREDENTIAL: %s\n\n", args)
-	// rp (and rp.id) is a required parameter; reject rather than nil-deref args.RP.ID later.
-	if args.RP == nil || args.RP.ID == "" {
-		ctapLogger.Printf("ERROR: MakeCredential missing rp/rp.id\n\n")
-		return []byte{byte(ctap2ErrMissingParam)}
+	if args.ClientDataHash == nil || args.RP == nil || args.RP.ID == "" || args.User == nil || args.PubKeyCredParams == nil {
+		ctapLogger.Printf("ERROR: MakeCredential is missing a required parameter\n\n")
+		return status(ctap2ErrMissingParam)
 	}
-	var flags authDataFlags = 0
-
 	supported := false
 	for _, param := range args.PubKeyCredParams {
 		if param.Algorithm == cose.COSE_ALGORITHM_ID_ES256 && param.Type == "public-key" {
@@ -301,101 +346,81 @@ func (server *CTAPServer) handleMakeCredential(data []byte) []byte {
 	}
 	if !supported {
 		ctapLogger.Printf("ERROR: Unsupported Algorithm\n\n")
-		return []byte{byte(ctap2ErrUnsupportedAlgorithm)}
+		return status(ctap2ErrUnsupportedAlgorithm)
+	}
+	if args.Options != nil && args.Options.UserPresence != nil && !*args.Options.UserPresence {
+		return status(ctap2ErrInvalidOption)
+	}
+	if code, isProbe := server.pinProbeResponse(args.PINUVAuthParam); isProbe {
+		return status(code)
 	}
 
+	residentKey := args.Options != nil && args.Options.ResidentKey
 	wantsUV := args.Options != nil && args.Options.UserVerification
-	rpName := ""
-	if args.RP != nil {
-		rpName = args.RP.Name
-	}
-	userName := ""
-	if args.User != nil {
-		userName = args.User.Name
-	}
+	params := fido_client.ClientActionRequestParams{RelyingPartyID: args.RP.ID, RelyingParty: args.RP.Name, UserName: args.User.Name}
 	uvSatisfied := false
-	if server.client.SupportsPIN() && server.client.PINHash() != nil {
-		if args.PINUVAuthParam != nil {
-			if args.PINUVAuthProtocol != 1 {
-				return []byte{byte(ctap2ErrPINAuthInvalid)}
-			}
-			token := server.pinTokenByChannel[server.currentChannelID]
-			// Standing-token fallback is allowed ONLY on the non-channel/test path
-			// (channel 0). Real HID traffic always carries a channel, so production
-			// requires a token actually issued via getPINToken on this channel.
-			if token == nil && server.currentChannelID == 0 {
-				token = server.client.PINToken()
-			}
-			if len(token) == 0 {
-				return []byte{byte(ctap2ErrPINAuthInvalid)}
-			}
-			pinAuth := server.derivePINAuth(token, args.ClientDataHash)
-			if subtle.ConstantTimeCompare(pinAuth, args.PINUVAuthParam) != 1 {
-				return []byte{byte(ctap2ErrPINAuthInvalid)}
-			}
-			uvSatisfied = true
-		} else if wantsUV {
-			params := fido_client.ClientActionRequestParams{RelyingParty: rpName, UserName: userName}
-			verified, status := server.attemptUserVerification(fido_client.ClientActionFIDOMakeCredential, params)
-			if verified {
-				uvSatisfied = true
-			} else if status != nil {
-				return []byte{byte(*status)}
-			} else {
-				return []byte{byte(ctap2ErrPINRequired)}
-			}
-		} else {
-			// A PIN is configured but the request supplied neither a pinUvAuthParam
-			// nor a uv option. CTAP2 requires CTAP2_ERR_PIN_REQUIRED here — do not
-			// fall through and create the credential without verification.
-			return []byte{byte(ctap2ErrPINRequired)}
+	if args.PINUVAuthParam != nil {
+		if code := server.verifyPINUVAuthParam(args.PINUVAuthProtocol, args.PINUVAuthParam, args.ClientDataHash); code != ctap1ErrSuccess {
+			return status(code)
 		}
+		uvSatisfied = true
 	} else if wantsUV {
-		params := fido_client.ClientActionRequestParams{RelyingParty: rpName, UserName: userName}
-		verified, status := server.attemptUserVerification(fido_client.ClientActionFIDOMakeCredential, params)
-		if verified {
-			uvSatisfied = true
-		} else if status != nil {
-			return []byte{byte(*status)}
-		} else {
-			return []byte{byte(ctap2ErrOperationDenied)}
+		verified, code := server.attemptUserVerification(fido_client.ClientActionFIDOMakeCredential, params)
+		if !verified {
+			if code != nil {
+				return status(*code)
+			}
+			return status(ctap2ErrOperationDenied)
 		}
-	}
-	if uvSatisfied {
-		flags = flags | authDataFlagUserVerified
+		uvSatisfied = true
+	} else if server.client.SupportsPIN() && server.client.PINHash() != nil {
+		// A PIN is configured but the request supplied neither a pinUvAuthParam
+		// nor a uv option: the platform must collect the PIN first.
+		return status(ctap2ErrPINRequired)
 	}
 
-	if !server.client.ApproveAccountCreation(rpName) {
-		ctapLogger.Printf("ERROR: Unapproved action (Create account)")
-		return []byte{byte(ctap2ErrOperationDenied)}
+	// The site already has a credential on this authenticator.
+	if len(args.ExcludeList) > 0 && len(server.client.GetAssertionSources(args.RP.ID, args.ExcludeList)) > 0 {
+		ctapLogger.Printf("MakeCredential: authenticator already registered with %s\n\n", args.RP.ID)
+		return status(ctap2ErrCredentialExcluded)
 	}
-	flags = flags | authDataFlagUserPresent
+
+	if code := server.requestApproval(func(ctx context.Context) bool {
+		if approver, ok := server.client.(ContextApprover); ok {
+			return approver.ApproveAccountCreationContext(ctx, args.RP, args.User)
+		}
+		return server.client.ApproveAccountCreation(args.RP.Name)
+	}); code != ctap1ErrSuccess {
+		ctapLogger.Printf("ERROR: Unapproved action (Create account)\n\n")
+		return status(code)
+	}
+	var flags authDataFlags = authDataFlagUserPresent
+	if uvSatisfied {
+		flags |= authDataFlagUserVerified
+	}
 
 	credentialSource := server.client.NewCredentialSource(args.PubKeyCredParams, args.ExcludeList, args.RP, args.User)
 	if credentialSource == nil {
 		ctapLogger.Printf("ERROR: Unsupported Algorithm\n\n")
-		return []byte{byte(ctap2ErrUnsupportedAlgorithm)}
+		return status(ctap2ErrUnsupportedAlgorithm)
 	}
-	// hmac-secret: if requested during MC, allocate credRandom
-	if args.Extensions != nil {
-		if extVal, ok := args.Extensions["hmac-secret"]; ok {
-			// If truthy, enable hmac-secret for this credential
-			enable := false
-			switch v := extVal.(type) {
-			case bool:
-				enable = v
-			default:
-				// Non-bool values are treated as request present
-				enable = true
-			}
-			if enable {
-				credentialSource.CredRandom = crypto.RandomBytes(32)
-				server.client.SaveState()
-			}
+	extensionOutputs := map[string]interface{}{}
+	server.updateCredential(func() {
+		credentialSource.Discoverable = residentKey
+		if enabled, ok := args.Extensions["hmac-secret"].(bool); ok && enabled {
+			credentialSource.CredRandom = crypto.RandomBytes(32)
+			extensionOutputs["hmac-secret"] = true
 		}
+	})
+	if residentKey {
+		server.replaceOlderDiscoverableCredentials(credentialSource)
+	}
+	var extensionData []byte
+	if len(extensionOutputs) > 0 {
+		extensionData = util.MarshalCBOR(extensionOutputs)
 	}
 	attestedCredentialData := makeAttestedCredentialData(credentialSource)
-	authenticatorData := makeAuthData(args.RP.ID, credentialSource, attestedCredentialData, flags)
+	authenticatorData := makeAuthDataWithExtensions(args.RP.ID, credentialSource, attestedCredentialData, flags, extensionData)
 
 	attestationCert := server.client.CreateAttestationCertificiate(credentialSource.PrivateKey)
 	attestationSignature := credentialSource.PrivateKey.Sign(append(authenticatorData, args.ClientDataHash...))
@@ -412,6 +437,86 @@ func (server *CTAPServer) handleMakeCredential(data []byte) []byte {
 	}
 	ctapLogger.Printf("MAKE CREDENTIAL RESPONSE: %#v\n\n", response)
 	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(response)...)
+}
+
+// requestApproval asks the user (via the client) and maps the outcome to a
+// CTAP status: success, OPERATION_DENIED, or KEEPALIVE_CANCEL if the host
+// cancelled while the prompt was up.
+func (server *CTAPServer) requestApproval(ask func(ctx context.Context) bool) ctapStatusCode {
+	ctx := server.requestContext()
+	server.userPresenceNeeded.Store(true)
+	approved := ask(ctx)
+	server.userPresenceNeeded.Store(false)
+	if ctx.Err() != nil {
+		return ctap2ErrKeepaliveCancel
+	}
+	if !approved {
+		return ctap2ErrOperationDenied
+	}
+	return ctap1ErrSuccess
+}
+
+func (server *CTAPServer) updateCredential(update func()) {
+	if updater, ok := server.client.(credentialUpdater); ok {
+		updater.UpdateCredential(update)
+		return
+	}
+	update()
+	server.client.SaveState()
+}
+
+// replaceOlderDiscoverableCredentials removes discoverable credentials for the
+// same relying party and user handle: a site re-registering an account
+// replaces its passkey rather than adding a duplicate.
+func (server *CTAPServer) replaceOlderDiscoverableCredentials(newSource *identities.CredentialSource) {
+	deleter, ok := server.client.(credentialDeleter)
+	if !ok || newSource.User == nil || newSource.RelyingParty == nil {
+		return
+	}
+	for _, existing := range server.client.GetAssertionSources(newSource.RelyingParty.ID, nil) {
+		if existing == newSource || !existing.Discoverable || existing.User == nil || bytes.Equal(existing.ID, newSource.ID) {
+			continue
+		}
+		if bytes.Equal(existing.User.ID, newSource.User.ID) {
+			deleter.DeleteIdentity(existing.ID)
+		}
+	}
+}
+
+// pinProbeResponse handles a zero-length pinUvAuthParam, which platforms send
+// to make the user pick an authenticator (CTAP 2.1 §6.1.2 step 1). The answer
+// tells them whether a PIN is set.
+func (server *CTAPServer) pinProbeResponse(pinUVAuthParam []byte) (ctapStatusCode, bool) {
+	if pinUVAuthParam == nil || len(pinUVAuthParam) != 0 || !server.client.SupportsPIN() {
+		return 0, false
+	}
+	if server.client.PINHash() == nil {
+		return ctap2ErrNoPINSet, true
+	}
+	return ctap2ErrPINInvalid, true
+}
+
+// verifyPINUVAuthParam checks pinUvAuthParam = LEFT(HMAC(pinUvAuthToken, clientDataHash), 16).
+func (server *CTAPServer) verifyPINUVAuthParam(protocol uint32, pinUVAuthParam []byte, clientDataHash []byte) ctapStatusCode {
+	if protocol != 1 {
+		return ctap1ErrInvalidParameter
+	}
+	if !server.client.SupportsPIN() || server.client.PINHash() == nil {
+		return ctap2ErrNoPINSet
+	}
+	// A token is only valid once handed out by getPINToken. Channel 0 (direct
+	// calls without the HID transport, e.g. tests) may use the standing token.
+	if !server.pinTokenIssued && server.currentChannelID != 0 {
+		return ctap2ErrPINAuthInvalid
+	}
+	token := server.client.PINToken()
+	if len(token) == 0 {
+		return ctap2ErrPINAuthInvalid
+	}
+	if subtle.ConstantTimeCompare(server.derivePINAuth(token, clientDataHash), pinUVAuthParam) != 1 {
+		return ctap2ErrPINAuthInvalid
+	}
+	return ctap1ErrSuccess
 }
 
 type getInfoOptions struct {
@@ -445,14 +550,14 @@ func (server *CTAPServer) handleGetInfo() []byte {
 		// A safe upper bound for our HID implementation; large enough for typical requests
 		MaxMessageSize: 4096,
 		Extensions:     []string{"hmac-secret"},
+		// hmac-secret needs a PIN/UV protocol for its key agreement even when
+		// PINs are disabled.
+		PINUVAuthProtocols: []uint32{1},
 	}
 	if server.client.SupportsPIN() {
 		var clientPINSet bool = server.client.PINHash() != nil
 		response.Options.HasClientPIN = &clientPINSet
-		response.PINUVAuthProtocols = []uint32{1}
 		// Do NOT set uv=true here; uv refers to on-device user verification, not PIN
-	} else {
-		response.PINUVAuthProtocols = []uint32{}
 	}
 	if server.client.SupportsUserVerification() {
 		uv := true
@@ -486,139 +591,121 @@ type getAssertionResponse struct {
 }
 
 func (server *CTAPServer) handleGetAssertion(data []byte) []byte {
-	var flags authDataFlags = 0
 	var args getAssertionArgs
-	err := cbor.Unmarshal(data, &args)
-	if err != nil {
-		ctapLogger.Printf("ERROR: %s", err)
-		return []byte{byte(ctap2ErrInvalidCBOR)}
-	}
-	// Normalize empty pinUvAuthParam to nil
-	if args.PINUVAuthParam != nil && len(args.PINUVAuthParam) == 0 {
-		args.PINUVAuthParam = nil
+	if err := cbor.Unmarshal(data, &args); err != nil {
+		ctapLogger.Printf("ERROR: invalid GetAssertion CBOR: %v\n\n", err)
+		return status(ctap2ErrInvalidCBOR)
 	}
 	ctapLogger.Printf("GET ASSERTION: %#v\n\n", args)
+	if args.RPID == "" || args.ClientDataHash == nil {
+		return status(ctap2ErrMissingParam)
+	}
+	if code, isProbe := server.pinProbeResponse(args.PINUVAuthParam); isProbe {
+		return status(code)
+	}
 
-	// Gather all matching credentials for multi-assertion support
+	// With an empty allowList only discoverable (resident) credentials qualify.
+	discoverable := len(args.AllowList) == 0
 	sources := server.client.GetAssertionSources(args.RPID, args.AllowList)
+	if discoverable {
+		filtered := sources[:0:0]
+		for _, source := range sources {
+			if source.Discoverable {
+				filtered = append(filtered, source)
+			}
+		}
+		sources = filtered
+	}
+
+	// User verification is only required when the platform asks for it; a
+	// pinUvAuthParam proves the user entered the PIN.
+	uvSatisfied := false
+	if args.PINUVAuthParam != nil {
+		if code := server.verifyPINUVAuthParam(args.PINUVAuthProtocol, args.PINUVAuthParam, args.ClientDataHash); code != ctap1ErrSuccess {
+			return status(code)
+		}
+		uvSatisfied = true
+	} else if args.Options.UserVerification {
+		params := fido_client.ClientActionRequestParams{RelyingPartyID: args.RPID}
+		verified, code := server.attemptUserVerification(fido_client.ClientActionFIDOGetAssertion, params)
+		if !verified {
+			if code != nil {
+				return status(*code)
+			}
+			return status(ctap2ErrOperationDenied)
+		}
+		uvSatisfied = true
+	}
+
 	if len(sources) == 0 {
 		ctapLogger.Printf("ERROR: No Credentials\n\n")
-		return []byte{byte(ctap2ErrNoCredentials)}
+		return status(ctap2ErrNoCredentials)
 	}
 	credentialSource := sources[0]
 	unsafeCtapLogger.Printf("CREDENTIAL SOURCE: %#v\n\n", credentialSource)
 
-	wantUV := args.Options.UserVerification
-	discoverable := len(args.AllowList) == 0
-	uvRequired := wantUV || discoverable
-	uvSatisfied := false
-	if args.PINUVAuthParam != nil {
-		if args.PINUVAuthProtocol != 1 {
-			return []byte{byte(ctap2ErrPINAuthInvalid)}
+	var flags authDataFlags = 0
+	if args.Options.UserPresence == nil || *args.Options.UserPresence {
+		if code := server.requestApproval(func(ctx context.Context) bool {
+			if approver, ok := server.client.(ContextApprover); ok {
+				return approver.ApproveAccountLoginContext(ctx, credentialSource)
+			}
+			return server.client.ApproveAccountLogin(credentialSource)
+		}); code != ctap1ErrSuccess {
+			ctapLogger.Printf("ERROR: Unapproved action (Account login)\n\n")
+			return status(code)
 		}
-		token := server.pinTokenByChannel[server.currentChannelID]
-		// Standing-token fallback only on the non-channel/test path (channel 0);
-		// production HID requires a token issued via getPINToken on this channel.
-		if token == nil && server.currentChannelID == 0 {
-			token = server.client.PINToken()
-		}
-		if len(token) == 0 {
-			return []byte{byte(ctap2ErrPINAuthInvalid)}
-		}
-		pinAuth := server.derivePINAuth(token, args.ClientDataHash)
-		if subtle.ConstantTimeCompare(pinAuth, args.PINUVAuthParam) != 1 {
-			return []byte{byte(ctap2ErrPINAuthInvalid)}
-		}
-		uvSatisfied = true
-	} else if uvRequired {
-		params := fido_client.ClientActionRequestParams{}
-		if credentialSource.RelyingParty != nil {
-			params.RelyingParty = credentialSource.RelyingParty.Name
-		}
-		if credentialSource.User != nil {
-			params.UserName = credentialSource.User.Name
-		}
-		verified, status := server.attemptUserVerification(fido_client.ClientActionFIDOGetAssertion, params)
-		if verified {
-			uvSatisfied = true
-		} else if status != nil {
-			return []byte{byte(*status)}
-		} else if server.client.SupportsPIN() && server.client.PINHash() != nil {
-			return []byte{byte(ctap2ErrPINRequired)}
-		} else if server.client.SupportsPIN() {
-			return []byte{byte(ctap2ErrNoPINSet)}
-		} else {
-			return []byte{byte(ctap2ErrOperationDenied)}
-		}
+		flags |= authDataFlagUserPresent
 	}
 	if uvSatisfied {
-		flags = flags | authDataFlagUserVerified
+		flags |= authDataFlagUserVerified
 	}
 
-	if args.Options.UserPresence == nil || *args.Options.UserPresence {
-		if !server.client.ApproveAccountLogin(credentialSource) {
-			ctapLogger.Printf("ERROR: Unapproved action (Account login)")
-			return []byte{byte(ctap2ErrOperationDenied)}
-		}
-		flags = flags | authDataFlagUserPresent
-	}
-
-	// Advance the signature counter only now — the assertion is approved and about
-	// to be signed. (GetAssertionSources no longer bumps it pre-approval.)
-	credentialSource.SignatureCounter++
-	server.client.SaveState()
-
-	// Extension handling (hmac-secret)
-	var extData []byte
 	var hmacInput *hmacSecretInput
-	if args.Extensions != nil {
-		if raw, ok := args.Extensions["hmac-secret"]; ok {
-			var in hmacSecretInput
-			if err := cbor.Unmarshal(raw, &in); err == nil && in.SaltEnc != nil && in.SaltAuth != nil && in.KeyAgreement != nil {
-				hmacInput = &in
-				// Compute hmac-secret output for this credential
-				out, ok := server.computeHmacSecretOutput(credentialSource, &in)
-				if ok {
-					// Build extension map {"hmac-secret": output}
-					extMap := map[string][]byte{"hmac-secret": out}
-					extData = util.MarshalCBOR(extMap)
-				}
-			}
+	if raw, ok := args.Extensions["hmac-secret"]; ok {
+		var in hmacSecretInput
+		if err := cbor.Unmarshal(raw, &in); err == nil && in.SaltEnc != nil && in.SaltAuth != nil && in.KeyAgreement != nil {
+			hmacInput = &in
 		}
 	}
-
-	authData := makeAuthDataWithExtensions(args.RPID, credentialSource, nil, flags, extData)
-	signature := credentialSource.PrivateKey.Sign(util.Concat(authData, args.ClientDataHash))
-
-	credentialDescriptor := credentialSource.CTAPDescriptor()
-	response := getAssertionResponse{
-		Credential:          &credentialDescriptor,
-		AuthenticatorData:   authData,
-		Signature:           signature,
-		User:                credentialSource.User,
-		NumberOfCredentials: 0,
-	}
-	if len(sources) > 1 {
+	response := server.makeAssertion(args.RPID, args.ClientDataHash, credentialSource, flags, hmacInput)
+	if discoverable && len(sources) > 1 {
 		response.NumberOfCredentials = int32(len(sources))
-	}
-
-	ctapLogger.Printf("GET ASSERTION RESPONSE: %#v\n\n", response)
-
-	// Save remaining for GetNextAssertion if multiple
-	if len(sources) > 1 && server.currentChannelID != 0 {
-		sess := &assertionSession{rpID: args.RPID, clientDataHash: args.ClientDataHash}
-		// Copy remaining
-		rem := make([]*identities.CredentialSource, len(sources)-1)
-		copy(rem, sources[1:])
-		sess.remaining = rem
-		if hmacInput != nil {
-			sess.hmacInput = *hmacInput
-			sess.useHmac = true
+		sess := &assertionSession{
+			rpID:           args.RPID,
+			clientDataHash: args.ClientDataHash,
+			flags:          flags,
+			remaining:      append([]*identities.CredentialSource{}, sources[1:]...),
+			hmacInput:      hmacInput,
 		}
 		server.assertionSessions[server.currentChannelID] = sess
 	}
-
+	ctapLogger.Printf("GET ASSERTION RESPONSE: %#v\n\n", response)
 	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(response)...)
+}
+
+// makeAssertion signs an assertion with credentialSource, advancing its
+// signature counter.
+func (server *CTAPServer) makeAssertion(rpID string, clientDataHash []byte, credentialSource *identities.CredentialSource, flags authDataFlags, hmacInput *hmacSecretInput) getAssertionResponse {
+	var extensionData []byte
+	if hmacInput != nil {
+		if out, ok := server.computeHmacSecretOutput(credentialSource, hmacInput); ok {
+			extensionData = util.MarshalCBOR(map[string][]byte{"hmac-secret": out})
+		}
+	}
+	var authData []byte
+	server.updateCredential(func() {
+		credentialSource.SignatureCounter++
+		authData = makeAuthDataWithExtensions(rpID, credentialSource, nil, flags, extensionData)
+	})
+	signature := credentialSource.PrivateKey.Sign(util.Concat(authData, clientDataHash))
+	credentialDescriptor := credentialSource.CTAPDescriptor()
+	return getAssertionResponse{
+		Credential:        &credentialDescriptor,
+		AuthenticatorData: authData,
+		Signature:         signature,
+		User:              credentialSource.User,
+	}
 }
 
 // ---------- hmac-secret support ----------
@@ -629,10 +716,14 @@ type hmacSecretInput struct {
 }
 
 func (server *CTAPServer) computeHmacSecretOutput(cred *identities.CredentialSource, in *hmacSecretInput) ([]byte, bool) {
-	if cred.CredRandom == nil || len(cred.CredRandom) == 0 {
+	if len(cred.CredRandom) == 0 || in.KeyAgreement == nil {
 		return nil, false
 	}
-	sharedSecret := server.getPINSharedSecret(*in.KeyAgreement)
+	sharedSecret, err := server.getPINSharedSecret(*in.KeyAgreement)
+	if err != nil {
+		ctapLogger.Printf("hmac-secret: %v\n\n", err)
+		return nil, false
+	}
 	// Verify saltAuth = HMAC(sharedSecret, saltEnc)[:16]
 	if subtle.ConstantTimeCompare(server.derivePINAuth(sharedSecret, in.SaltEnc), in.SaltAuth) != 1 {
 		return nil, false
@@ -659,54 +750,24 @@ func (server *CTAPServer) computeHmacSecretOutput(cred *identities.CredentialSou
 type assertionSession struct {
 	rpID           string
 	clientDataHash []byte
+	flags          authDataFlags
 	remaining      []*identities.CredentialSource
-	useHmac        bool
-	hmacInput      hmacSecretInput
-}
-
-type pinSession struct {
-	key *crypto.ECDHKey
+	hmacInput      *hmacSecretInput
 }
 
 func (server *CTAPServer) handleGetNextAssertion() []byte {
 	sess, ok := server.assertionSessions[server.currentChannelID]
 	if !ok || sess == nil || len(sess.remaining) == 0 {
-		return []byte{byte(ctap1ErrInvalidSequence)}
+		return status(ctap2ErrNotAllowed)
 	}
-	// Pop next
 	cred := sess.remaining[0]
 	sess.remaining = sess.remaining[1:]
-
-	var flags authDataFlags = 0
-	// For simplicity: set UP on each next assertion (user presence was approved earlier)
-	flags = flags | authDataFlagUserPresent
-
-	var extData []byte
-	if sess.useHmac {
-		if out, ok := server.computeHmacSecretOutput(cred, &sess.hmacInput); ok {
-			extMap := map[string][]byte{"hmac-secret": out}
-			extData = util.MarshalCBOR(extMap)
-		}
-	}
-	// Increment signature counter for this credential
-	cred.SignatureCounter++
-	server.client.SaveState()
-	authData := makeAuthDataWithExtensions(sess.rpID, cred, nil, flags, extData)
-	signature := cred.PrivateKey.Sign(util.Concat(authData, sess.clientDataHash))
-	credDesc := cred.CTAPDescriptor()
-	resp := getAssertionResponse{
-		Credential:        &credDesc,
-		AuthenticatorData: authData,
-		Signature:         signature,
-		User:              cred.User,
-	}
-	// Cleanup when done
 	if len(sess.remaining) == 0 {
 		delete(server.assertionSessions, server.currentChannelID)
-	} else {
-		server.assertionSessions[server.currentChannelID] = sess
 	}
-	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(resp)...)
+	// The user was present (and verified) for the GetAssertion this continues.
+	response := server.makeAssertion(sess.rpID, sess.clientDataHash, cred, sess.flags, sess.hmacInput)
+	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(response)...)
 }
 
 type clientPINSubcommand uint32
@@ -765,39 +826,14 @@ func (args clientPINResponse) String() string {
 		args.Retries)
 }
 
-func (server *CTAPServer) getPINSharedSecret(remoteKey cose.COSEEC2Key) []byte {
-	var pinKey *crypto.ECDHKey
-	used := server.currentChannelID
-	if sess, ok := server.pinSessions[used]; ok && sess != nil && sess.key != nil {
-		pinKey = sess.key
-	} else if sess0, ok0 := server.pinSessions[0]; ok0 && sess0 != nil && sess0.key != nil {
-		// Fallback to channel 0 bucket if channel was not propagated
-		pinKey = sess0.key
-		used = 0
+// getPINSharedSecret derives the PIN protocol 1 shared secret,
+// SHA-256(ECDH x-coordinate), with the authenticator's key agreement key.
+func (server *CTAPServer) getPINSharedSecret(remoteKey cose.COSEEC2Key) ([]byte, error) {
+	x, err := server.client.PINKeyAgreement().SharedSecret(remoteKey.X, remoteKey.Y)
+	if err != nil {
+		return nil, err
 	}
-	if pinKey == nil {
-		pinKey = server.client.PINKeyAgreement()
-		ctapLogger.Printf("PIN SHARED SECRET using client key (chan=0x%x)\n\n", server.currentChannelID)
-	} else {
-		if used == 0 {
-			ctapLogger.Printf("PIN SHARED SECRET using session key from chan=0x0 (fallback)\n\n")
-		} else {
-			ctapLogger.Printf("PIN SHARED SECRET using session key (chan=0x%x)\n\n", used)
-		}
-	}
-	// ECDH X coordinate must be 32-byte big-endian before hashing (CTAP v1)
-	x := pinKey.ECDH(util.BytesToBigInt(remoteKey.X), util.BytesToBigInt(remoteKey.Y))
-	if len(x) != 32 {
-		padded := make([]byte, 32)
-		if len(x) > 32 {
-			// Should not happen for P-256; take least significant 32 bytes
-			copy(padded, x[len(x)-32:])
-		} else {
-			copy(padded[32-len(x):], x)
-		}
-		x = padded
-	}
-	return crypto.HashSHA256(x)
+	return crypto.HashSHA256(x), nil
 }
 
 func (server *CTAPServer) derivePINAuth(sharedSecret []byte, data []byte) []byte {
@@ -824,6 +860,10 @@ func (server *CTAPServer) decryptPIN(sharedSecret []byte, pinEncoding []byte) []
 
 func (server *CTAPServer) attemptUserVerification(action fido_client.ClientAction, params fido_client.ClientActionRequestParams) (bool, *ctapStatusCode) {
 	if !server.client.SupportsUserVerification() {
+		if server.client.SupportsPIN() && server.client.PINHash() != nil {
+			code := ctap2ErrPINRequired
+			return false, &code
+		}
 		return false, nil
 	}
 	if server.client.VerifyUser(action, params) {
@@ -831,79 +871,59 @@ func (server *CTAPServer) attemptUserVerification(action fido_client.ClientActio
 	}
 	if server.client.SupportsPIN() {
 		if server.client.PINHash() != nil {
-			status := ctap2ErrPINRequired
-			return false, &status
+			code := ctap2ErrPINRequired
+			return false, &code
 		}
-		status := ctap2ErrNoPINSet
-		return false, &status
+		code := ctap2ErrNoPINSet
+		return false, &code
 	}
-	status := ctap2ErrOperationDenied
-	return false, &status
+	code := ctap2ErrOperationDenied
+	return false, &code
 }
 
 func (server *CTAPServer) handleClientPIN(data []byte) []byte {
-	if !server.client.SupportsPIN() {
-		return []byte{byte(ctap1ErrInvalidCommand)}
-	}
 	var args clientPINArgs
-	err := cbor.Unmarshal(data, &args)
-	if err != nil {
-		ctapLogger.Printf("ERROR: %s", err)
-		return []byte{byte(ctap2ErrInvalidCBOR)}
-	}
-	if args.PINUVAuthProtocol != 1 {
-		return []byte{byte(ctap1ErrInvalidParameter)}
+	if err := cbor.Unmarshal(data, &args); err != nil {
+		ctapLogger.Printf("ERROR: invalid ClientPIN CBOR: %v\n\n", err)
+		return status(ctap2ErrInvalidCBOR)
 	}
 	ctapLogger.Printf("CLIENT_PIN: %v\n\n", args)
-	var response []byte
+	if args.PINUVAuthProtocol != 1 {
+		return status(ctap1ErrInvalidParameter)
+	}
+	// hmac-secret uses the key agreement too, so it works without PIN support.
+	if args.SubCommand == clientPinSubcommandGetKeyAgreement {
+		return server.handleGetKeyAgreement()
+	}
+	if !server.client.SupportsPIN() {
+		return status(ctap1ErrInvalidCommand)
+	}
 	switch args.SubCommand {
 	case clientPINSubcommandGetRetries:
-		response = server.handleGetRetries()
-	case clientPinSubcommandGetKeyAgreement:
-		response = server.handleGetKeyAgreement()
+		return server.handleGetRetries()
 	case clientPINSubcommandSetPIN:
-		response = server.handleSetPIN(args)
+		return server.handleSetPIN(args)
 	case clientPINSubcommandChangePIN:
-		response = server.handleChangePIN(args)
-	case clientPinSubcommandGetPINToken:
-		response = server.handleGetPINToken(args)
-	case clientPinSubcommandGetPinUvAuthTokenUsingPin:
-		response = server.handleGetPinUvAuthTokenUsingPin(args)
+		return server.handleChangePIN(args)
+	case clientPinSubcommandGetPINToken, clientPinSubcommandGetPinUvAuthTokenUsingPin:
+		return server.handleGetPINToken(args)
 	default:
-		// Return INVALID_SUBCOMMAND for unknown ClientPIN subcommands
-		return []byte{byte(ctap2ErrInvalidSubcommand)}
+		return status(ctap2ErrInvalidSubcommand)
 	}
-	ctapLogger.Printf("CLIENT_PIN RESPONSE: %#v\n\n", response)
-	return response
 }
 
 func (server *CTAPServer) handleGetRetries() []byte {
-	// If no PIN has been set, CTAP2 requires returning ctap2ErrNoPINSet
-	if server.client.PINHash() == nil {
-		ctapLogger.Printf("CLIENT_PIN_GET_RETRIES: No PIN set\n\n")
-		return []byte{byte(ctap2ErrNoPINSet)}
-	}
 	retries := uint8(server.client.PINRetries())
 	response := clientPINResponse{Retries: &retries}
 	ctapLogger.Printf("CLIENT_PIN_GET_RETRIES: %v\n\n", response)
 	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(response)...)
 }
 
+// handleGetKeyAgreement returns the authenticator's key agreement public key.
+// It stays the same until a wrong PIN rotates it, so a platform may reuse one
+// shared secret for getPINToken and hmac-secret (libfido2 does).
 func (server *CTAPServer) handleGetKeyAgreement() []byte {
-	// Use per-channel ephemeral ECDH key and persist until token request completes
-	var sess *pinSession
-	cid := server.currentChannelID // may be 0 if HID didn't set channel
-	if s, ok := server.pinSessions[cid]; ok && s != nil && s.key != nil {
-		sess = s
-	}
-	if sess == nil {
-		sess = &pinSession{key: crypto.GenerateECDHKey()}
-		// Persist even when cid==0 as a fallback bucket
-		server.pinSessions[cid] = sess
-	}
-	ctapLogger.Printf("CLIENT_PIN GET_KEY_AGREEMENT: generated ephemeral ECDH key for chan=0x%x\n\n", cid)
-	key := sess.key
-	// Ensure X and Y are 32-byte big-endian values
+	key := server.client.PINKeyAgreement()
 	pad32 := func(b []byte) []byte {
 		if len(b) >= 32 {
 			return b
@@ -927,102 +947,116 @@ func (server *CTAPServer) handleGetKeyAgreement() []byte {
 
 func (server *CTAPServer) handleSetPIN(args clientPINArgs) []byte {
 	if server.client.PINHash() != nil {
-		return []byte{byte(ctap2ErrPINAuthInvalid)}
+		return status(ctap2ErrPINAuthInvalid)
 	}
 	if args.KeyAgreement == nil || args.PINUVAuthParam == nil || args.NewPINEncoding == nil {
-		return []byte{byte(ctap2ErrMissingParam)}
+		return status(ctap2ErrMissingParam)
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
+	sharedSecret, err := server.getPINSharedSecret(*args.KeyAgreement)
+	if err != nil {
+		ctapLogger.Printf("setPIN: %v\n\n", err)
+		return status(ctap1ErrInvalidParameter)
+	}
 	pinAuth := server.derivePINAuth(sharedSecret, args.NewPINEncoding)
 	if subtle.ConstantTimeCompare(pinAuth, args.PINUVAuthParam) != 1 {
-		return []byte{byte(ctap2ErrPINAuthInvalid)}
+		return status(ctap2ErrPINAuthInvalid)
 	}
 	decryptedPIN := server.decryptPIN(sharedSecret, args.NewPINEncoding)
 	if len(decryptedPIN) < 4 {
-		return []byte{byte(ctap2ErrPINPolicyViolation)}
+		return status(ctap2ErrPINPolicyViolation)
 	}
 	pinHash := crypto.HashSHA256(decryptedPIN)[:16]
-	server.client.SetPINRetries(8)
-	server.pinBootFailures = 0
 	server.client.SetPINHash(pinHash)
-	// Setting a PIN rotates the pinUvAuthToken and drops cached per-channel tokens.
+	server.client.SetPINRetries(pinMaxRetries)
+	server.pinBootFailures = 0
+	// Setting a PIN invalidates previously issued tokens.
 	server.client.RotatePINToken()
-	server.pinTokenByChannel = make(map[uint32][]byte)
+	server.pinTokenIssued = false
 	unsafeCtapLogger.Printf("SETTING PIN HASH: %v\n\n", hex.EncodeToString(pinHash))
-	return []byte{byte(ctap1ErrSuccess)}
+	return status(ctap1ErrSuccess)
 }
-
-const pinMaxBootFailures = 3
 
 // pinBootBlocked reports whether the per-power-cycle wrong-PIN limit is reached.
 func (server *CTAPServer) pinBootBlocked() bool {
 	return server.pinBootFailures >= pinMaxBootFailures
 }
 
-// pinFailureResponse records a wrong-PIN attempt: it invalidates the shared secret
-// by rotating the key agreement (forcing the platform to re-handshake) and the
-// per-channel PIN session, counts the failure toward the per-power-cycle limit,
-// then returns the appropriate CTAP error (Blocked > AuthBlocked > Invalid).
+// pinFailureResponse records a wrong-PIN attempt: it rotates the key agreement
+// (forcing the platform to re-handshake), counts the failure toward the
+// per-power-cycle limit, then returns the appropriate CTAP error
+// (Blocked > AuthBlocked > Invalid).
 func (server *CTAPServer) pinFailureResponse() []byte {
 	server.client.RotatePINKeyAgreement()
-	if server.currentChannelID != 0 {
-		delete(server.pinSessions, server.currentChannelID)
-	}
 	server.pinBootFailures++
 	if server.client.PINRetries() <= 0 {
-		return []byte{byte(ctap2ErrPINBlocked)}
+		return status(ctap2ErrPINBlocked)
 	}
 	if server.pinBootBlocked() {
-		return []byte{byte(ctap2ErrPINAuthBlocked)}
+		return status(ctap2ErrPINAuthBlocked)
 	}
-	return []byte{byte(ctap2ErrPINInvalid)}
+	return status(ctap2ErrPINInvalid)
 }
 
 func (server *CTAPServer) handleChangePIN(args clientPINArgs) []byte {
-	if args.KeyAgreement == nil || args.PINUVAuthParam == nil {
-		return []byte{byte(ctap2ErrMissingParam)}
+	if server.client.PINHash() == nil {
+		return status(ctap2ErrNoPINSet)
+	}
+	if args.KeyAgreement == nil || args.PINUVAuthParam == nil || args.NewPINEncoding == nil || args.PINHashEncoding == nil {
+		return status(ctap2ErrMissingParam)
 	}
 	if server.client.PINRetries() <= 0 {
-		return []byte{byte(ctap2ErrPINBlocked)}
+		return status(ctap2ErrPINBlocked)
 	}
 	if server.pinBootBlocked() {
-		return []byte{byte(ctap2ErrPINAuthBlocked)}
+		return status(ctap2ErrPINAuthBlocked)
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
-	pinAuth := server.derivePINAuth(sharedSecret, append(args.NewPINEncoding, args.PINHashEncoding...))
+	sharedSecret, err := server.getPINSharedSecret(*args.KeyAgreement)
+	if err != nil {
+		ctapLogger.Printf("changePIN: %v\n\n", err)
+		return status(ctap1ErrInvalidParameter)
+	}
+	pinAuth := server.derivePINAuth(sharedSecret, util.Concat(args.NewPINEncoding, args.PINHashEncoding))
 	if subtle.ConstantTimeCompare(pinAuth, args.PINUVAuthParam) != 1 {
-		return []byte{byte(ctap2ErrPINAuthInvalid)}
+		return status(ctap2ErrPINAuthInvalid)
 	}
 	server.client.SetPINRetries(server.client.PINRetries() - 1)
 	decryptedPINHash := crypto.DecryptAESCBC(sharedSecret, args.PINHashEncoding)
 	if subtle.ConstantTimeCompare(server.client.PINHash(), decryptedPINHash) != 1 {
 		return server.pinFailureResponse()
 	}
-	server.client.SetPINRetries(8)
+	server.client.SetPINRetries(pinMaxRetries)
 	server.pinBootFailures = 0
 	newPIN := server.decryptPIN(sharedSecret, args.NewPINEncoding)
 	if len(newPIN) < 4 {
-		return []byte{byte(ctap2ErrPINPolicyViolation)}
+		return status(ctap2ErrPINPolicyViolation)
 	}
-	pinHash := crypto.HashSHA256(newPIN)[:16]
-	server.client.SetPINHash(pinHash)
-	// Changing the PIN rotates the pinUvAuthToken and drops cached per-channel tokens.
+	server.client.SetPINHash(crypto.HashSHA256(newPIN)[:16])
+	// Changing the PIN invalidates previously issued tokens.
 	server.client.RotatePINToken()
-	server.pinTokenByChannel = make(map[uint32][]byte)
-	return []byte{byte(ctap1ErrSuccess)}
+	server.pinTokenIssued = false
+	return status(ctap1ErrSuccess)
 }
 
+// handleGetPINToken implements getPINToken (0x05) and CTAP 2.1
+// getPinUvAuthTokenUsingPin (0x09); permissions and rpId are not enforced.
 func (server *CTAPServer) handleGetPINToken(args clientPINArgs) []byte {
-	if args.PINHashEncoding == nil || args.KeyAgreement.X == nil {
-		return []byte{byte(ctap2ErrMissingParam)}
+	if server.client.PINHash() == nil {
+		return status(ctap2ErrNoPINSet)
+	}
+	if args.PINHashEncoding == nil || args.KeyAgreement == nil {
+		return status(ctap2ErrMissingParam)
 	}
 	if server.client.PINRetries() <= 0 {
-		return []byte{byte(ctap2ErrPINBlocked)}
+		return status(ctap2ErrPINBlocked)
 	}
 	if server.pinBootBlocked() {
-		return []byte{byte(ctap2ErrPINAuthBlocked)}
+		return status(ctap2ErrPINAuthBlocked)
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
+	sharedSecret, err := server.getPINSharedSecret(*args.KeyAgreement)
+	if err != nil {
+		ctapLogger.Printf("getPINToken: %v\n\n", err)
+		return status(ctap1ErrInvalidParameter)
+	}
 	server.client.SetPINRetries(server.client.PINRetries() - 1)
 	pinHash := server.decryptPINHash(sharedSecret, args.PINHashEncoding)
 	unsafeCtapLogger.Printf("TRYING PIN HASH: %v\n\n", hex.EncodeToString(pinHash))
@@ -1030,56 +1064,11 @@ func (server *CTAPServer) handleGetPINToken(args clientPINArgs) []byte {
 		unsafeCtapLogger.Printf("MISMATCH: Provided PIN %v doesn't match stored PIN %v\n\n", hex.EncodeToString(pinHash), hex.EncodeToString(server.client.PINHash()))
 		return server.pinFailureResponse()
 	}
-	server.client.SetPINRetries(8)
+	server.client.SetPINRetries(pinMaxRetries)
 	server.pinBootFailures = 0
-	// Issue encrypted token; also cache plaintext per channel for MC/GA verification
-	plain := server.client.PINToken()
-	enc := crypto.EncryptAESCBC(sharedSecret, plain)
+	server.pinTokenIssued = true
+	enc := crypto.EncryptAESCBC(sharedSecret, server.client.PINToken())
 	response := clientPINResponse{PinToken: enc}
-	if server.currentChannelID != 0 {
-		server.pinTokenByChannel[server.currentChannelID] = plain
-	}
-	ctapLogger.Printf("GET_PIN_TOKEN RESPONSE: token(enc_len=%d) cached(chan=0x%x)\n\n", len(enc), server.currentChannelID)
-	// Clear per-channel PIN session after successful token issuance
-	if server.currentChannelID != 0 {
-		delete(server.pinSessions, server.currentChannelID)
-	}
-	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(response)...)
-}
-
-// CTAP 2.1: getPinUvAuthTokenUsingPin behaves similarly to getPINToken (0x05)
-// Minimal implementation: validate PIN and return encrypted pinUvAuthToken.
-// Ignores permissions and rpId for now; server-side will accept the token for MC/GA without checking permissions.
-func (server *CTAPServer) handleGetPinUvAuthTokenUsingPin(args clientPINArgs) []byte {
-	if args.PINHashEncoding == nil || args.KeyAgreement == nil || args.KeyAgreement.X == nil {
-		return []byte{byte(ctap2ErrMissingParam)}
-	}
-	if server.client.PINRetries() <= 0 {
-		return []byte{byte(ctap2ErrPINBlocked)}
-	}
-	if server.pinBootBlocked() {
-		return []byte{byte(ctap2ErrPINAuthBlocked)}
-	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
-	server.client.SetPINRetries(server.client.PINRetries() - 1)
-	pinHash := server.decryptPINHash(sharedSecret, args.PINHashEncoding)
-	unsafeCtapLogger.Printf("TRYING PIN HASH (2.1): %v\n\n", hex.EncodeToString(pinHash))
-	if subtle.ConstantTimeCompare(pinHash, server.client.PINHash()) != 1 {
-		unsafeCtapLogger.Printf("MISMATCH (2.1): Provided PIN %v doesn't match stored PIN %v\n\n", hex.EncodeToString(pinHash), hex.EncodeToString(server.client.PINHash()))
-		return server.pinFailureResponse()
-	}
-	server.client.SetPINRetries(8)
-	server.pinBootFailures = 0
-	plain := server.client.PINToken()
-	enc := crypto.EncryptAESCBC(sharedSecret, plain)
-	response := clientPINResponse{PinToken: enc}
-	if server.currentChannelID != 0 {
-		server.pinTokenByChannel[server.currentChannelID] = plain
-	}
-	ctapLogger.Printf("GET_PIN_UV_TOKEN (2.1) RESPONSE: token(enc_len=%d) cached(chan=0x%x)\n\n", len(enc), server.currentChannelID)
-	// Clear per-channel PIN session after successful token issuance
-	if server.currentChannelID != 0 {
-		delete(server.pinSessions, server.currentChannelID)
-	}
+	ctapLogger.Printf("GET_PIN_TOKEN RESPONSE: token(enc_len=%d) chan=0x%x\n\n", len(enc), server.currentChannelID)
 	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(response)...)
 }

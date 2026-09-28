@@ -183,21 +183,22 @@ func (setup *usbSetupPacket) setDirection(direction usbDirection) {
 	setup.BmRequestType |= (uint8(direction) << 7)
 }
 
+// bmRequestType: bit 7 direction, bits 6..5 type, bits 4..0 recipient.
 func (setup *usbSetupPacket) requestClass() usbRequestClass {
-	return usbRequestClass((setup.BmRequestType >> 4) & 0b11)
+	return usbRequestClass((setup.BmRequestType >> 5) & 0b11)
 }
 
 func (setup *usbSetupPacket) setRequestClass(class usbRequestClass) {
-	setup.BmRequestType &= ^(uint8(0b11) << 4)
-	setup.BmRequestType |= uint8(class) << 4
+	setup.BmRequestType &= ^(uint8(0b11) << 5)
+	setup.BmRequestType |= uint8(class) << 5
 }
 
 func (setup *usbSetupPacket) recipient() usbRequestRecipient {
-	return usbRequestRecipient(setup.BmRequestType & 0b1111)
+	return usbRequestRecipient(setup.BmRequestType & 0b11111)
 }
 
 func (setup *usbSetupPacket) setRecipient(recipient usbRequestRecipient) {
-	setup.BmRequestType &= ^uint8(0b1111)
+	setup.BmRequestType &= ^uint8(0b11111)
 	setup.BmRequestType |= uint8(recipient)
 }
 

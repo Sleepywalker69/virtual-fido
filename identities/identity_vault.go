@@ -19,6 +19,9 @@ type CredentialSource struct {
 	SignatureCounter int32
 	// hmac-secret support: per-credential secret value
 	CredRandom []byte
+	// Discoverable (resident) credentials can be used without the site naming
+	// them first (passkey / usernameless sign-in).
+	Discoverable bool
 }
 
 func (source *CredentialSource) CTAPDescriptor() webauthn.PublicKeyCredentialDescriptor {
@@ -59,6 +62,7 @@ func (vault *IdentityVault) NewIdentity(relyingParty *webauthn.PublicKeyCredenti
 		RelyingParty:     rpCopy,
 		User:             userCopy,
 		SignatureCounter: 0,
+		Discoverable:     true,
 	}
 	vault.AddIdentity(&credentialSource)
 	return &credentialSource
@@ -82,7 +86,7 @@ func (vault *IdentityVault) DeleteIdentity(id []byte) bool {
 func (vault *IdentityVault) GetMatchingCredentialSources(relyingPartyID string, allowList []webauthn.PublicKeyCredentialDescriptor) []*CredentialSource {
 	sources := make([]*CredentialSource, 0)
 	for _, credentialSource := range vault.CredentialSources {
-		if credentialSource.RelyingParty.ID == relyingPartyID {
+		if credentialSource.RelyingParty != nil && credentialSource.RelyingParty.ID == relyingPartyID {
 			if allowList != nil {
 				for _, allowedSource := range allowList {
 					if bytes.Equal(allowedSource.ID, credentialSource.ID) {
@@ -110,6 +114,7 @@ func (vault *IdentityVault) Export() []SavedCredentialSource {
 			User:             *source.User,
 			SignatureCounter: source.SignatureCounter,
 			CredRandom:       source.CredRandom,
+			NotDiscoverable:  !source.Discoverable,
 		}
 		sources = append(sources, savedSource)
 	}
@@ -136,6 +141,7 @@ func (vault *IdentityVault) Import(sources []SavedCredentialSource) error {
 			User:             &userCopy,
 			SignatureCounter: source.SignatureCounter,
 			CredRandom:       source.CredRandom,
+			Discoverable:     !source.NotDiscoverable,
 		}
 		vault.AddIdentity(&decodedSource)
 	}
